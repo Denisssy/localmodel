@@ -218,7 +218,7 @@ macro_rules! profile_knobs {
     )*) => {
         /// One scope of launch settings: `[defaults]` or `[model.NAME]`.
         /// Every field is optional so a profile overrides just what it needs.
-        #[derive(Default, Clone, Serialize, Deserialize)]
+        #[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         pub struct Profile {
             /// model file stem this profile applies to; set on named side

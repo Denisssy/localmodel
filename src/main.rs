@@ -6,9 +6,11 @@ mod gguf;
 mod jinja;
 mod knobs;
 mod models;
+mod resolve;
 mod server;
 mod settings;
 mod stats;
+mod validate;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
@@ -28,6 +30,7 @@ use dialoguer::{Input, Select};
 use serde_json::{json, Value};
 
 use models::Model;
+use resolve::Origin;
 use settings::Profile;
 use stats::Stats;
 
@@ -58,6 +61,10 @@ struct RunOpts {
     alias: Option<String>,
     repl: bool,
     dry_run: bool,
+    /// show where every setting came from, then exit (implies --dry-run)
+    explain: bool,
+    /// fail instead of warning when `extra` names an unknown or shadowed flag
+    strict: bool,
     llama_help: bool,
     /// auto | strata | llama
     engine: Option<String>,
@@ -88,6 +95,8 @@ impl Default for RunOpts {
             alias: None,
             repl: false,
             dry_run: false,
+            explain: false,
+            strict: false,
             llama_help: false,
             engine: None,
             family: None,
@@ -130,39 +139,11 @@ struct Cfg {
 }
 
 impl Cfg {
+    /// Kept for callers that already merged defaults with a model profile.
+    /// `explain` is the source of truth; this is the no-provenance wrapper.
+    #[cfg(test)]
     fn resolve(o: &RunOpts, p: &Profile) -> Self {
-        let ctk = o
-            .ctk
-            .clone()
-            .or_else(|| p.ctk.clone())
-            .unwrap_or_else(|| "q8_0".into());
-        let ctv = o
-            .ctv
-            .clone()
-            .or_else(|| p.ctv.clone())
-            .unwrap_or_else(|| ctk.clone());
-        Self {
-            ctx: o.ctx.or(p.ctx).unwrap_or(131072),
-            port: o.port.or(p.port),
-            ngl: o.ngl.or(p.ngl),
-            ncmoe: o.ncmoe.or(p.ncmoe),
-            ctk,
-            ctv,
-            threads: o.threads.or(p.threads),
-            reasoning: o.reasoning.clone().or_else(|| p.reasoning.clone()),
-            effort: o.effort.clone().or_else(|| p.effort.clone()),
-            draft_tokens: o.draft_tokens.or(p.draft_tokens),
-            extra: o.extra.clone().or_else(|| p.extra.clone()),
-            tools: o.tools.clone().or_else(|| p.tools.clone()),
-            draft_gpu: o.draft_gpu.or(p.draft_gpu).unwrap_or(false),
-            vision: o.vision.as_deref() == Some("on") || p.vision.unwrap_or(false),
-            mmproj: o.mmproj.clone().or_else(|| p.mmproj.clone()),
-            alias: o.alias.clone().or_else(|| p.alias.clone()),
-            flash_attn: p.flash_attn.unwrap_or(true),
-            temp: p.temp.unwrap_or(1.0),
-            top_p: p.top_p.unwrap_or(0.95),
-            host: p.host.clone().unwrap_or_else(|| "127.0.0.1".into()),
-        }
+        Self::explain(o, p, None).0
     }
 }
 
@@ -240,6 +221,8 @@ USAGE:
   localmodel info <model>         print the model card without launching
   localmodel params [pattern]     llama.cpp parameters cheat sheet / grep --help
   localmodel settings [--show]    edit saved per-model / per-pack / global launch settings
+  localmodel settings --model M --set ctx=262144 [--unset ctk]   non-interactive edit
+  localmodel settings --model M --show --origin                  where each value comes from
   localmodel add <url> [--name F] download a .gguf into the models folder
   localmodel list                 list downloaded models
   localmodel stop                 stop running localmodel servers
@@ -275,6 +258,8 @@ RUN OPTIONS:
   --extra \"...\"  extra engine flags (after saved ones, so they win)
   --repl         chat in the terminal instead of the dashboard
   --dry-run      print the exact command and exit
+  --explain      print where each setting came from, then exit (implies --dry-run)
+  --strict       treat unknown/shadowed `extra` flags as errors
   --llama-help   print `llama-server --help` and exit
 
 The dashboard is the default on a TTY: the card stays put, stats update in
@@ -2293,6 +2278,115 @@ fn strata_target(args: &[String]) -> Option<(String, String, Vec<String>)> {
     None
 }
 
+/// Value that follows `flag` in an argv vector.
+fn argv_value<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
+    argv.iter()
+        .position(|a| a == flag)
+        .and_then(|i| argv.get(i + 1))
+        .map(String::as_str)
+}
+
+/// Shared by `run --explain` and `settings --show --origin`.
+fn print_origin_rows(origins: &[Origin]) {
+    println!("  {:<14} {:<26} {}", "SETTING", "VALUE", "SOURCE");
+    for o in origins {
+        let src = if o.note.is_empty() {
+            o.from.label().to_string()
+        } else {
+            format!("{} ({})", o.from.label(), o.note)
+        };
+        println!("  {:<14} {:<26} {}", o.key, truncate(&o.value, 24), src);
+    }
+}
+
+/// `run --explain`: the resolved knobs and their origin, then the per-model
+/// values that `build_args` derives from the model itself.
+fn print_explain(
+    m: &Model,
+    profile: &str,
+    has_profile: bool,
+    cfg: &Cfg,
+    origins: &[Origin],
+    port: u16,
+    argv: Option<&[String]>,
+) {
+    let stem = models::stem(&m.name);
+    println!("model    {stem}");
+    if has_profile {
+        println!("profile  [model.\"{profile}\"] over [defaults]");
+    } else if profile == stem {
+        println!("profile  [defaults] only (no [model.\"{profile}\"] entry)");
+    } else {
+        println!("profile  [model.\"{profile}\"] not found, using [defaults]");
+    }
+    println!("order    cli > model > defaults > builtin > derived");
+    println!();
+    print_origin_rows(origins);
+
+    // Values no profile can set: hardcoded per model class, or constants.
+    let mut rows: Vec<(&str, String, String)> = Vec::new();
+    if cfg.port.is_none() {
+        rows.push(("port", port.to_string(), "first free from 8080".into()));
+    }
+    if let Some(argv) = argv {
+        let from_extra = |f: &str| {
+            cfg.extra
+                .as_deref()
+                .map(|e| e.split_whitespace().any(|p| p == f || p.starts_with(&format!("{f}="))))
+                .unwrap_or(false)
+        };
+        if cfg.ngl.is_none() {
+            if let Some(v) = argv_value(argv, "-ngl") {
+                let note = if m.moe { "MoE default (all layers)" } else { "dense default (all layers)" };
+                rows.push(("ngl", v.to_string(), note.into()));
+            }
+        }
+        if cfg.ncmoe.is_none() {
+            if let Some(v) = argv_value(argv, "--n-cpu-moe") {
+                rows.push(("ncmoe", v.to_string(), "MoE default".into()));
+            }
+        }
+        if let Some(v) = argv_value(argv, "--batch-size") {
+            let note = if from_extra("--batch-size") { "from extra" } else { "model class default" };
+            rows.push(("batch-size", v.to_string(), note.into()));
+        }
+        if let Some(v) = argv_value(argv, "--ubatch-size") {
+            let note = if from_extra("--ubatch-size") { "from extra" } else { "model class default" };
+            rows.push(("ubatch-size", v.to_string(), note.into()));
+        }
+        if cfg.draft_tokens.is_none() {
+            if let Some(v) = argv_value(argv, "--spec-draft-n-max") {
+                rows.push(("draft_tokens", v.to_string(), "speculative default".into()));
+            }
+        }
+        if let Some(v) = argv_value(argv, "--spec-type") {
+            let note = if m.nextn { "built-in MTP head" } else { "external draft file" };
+            rows.push(("spec-type", v.to_string(), note.into()));
+        }
+        if let Some(v) = argv_value(argv, "--top-k") {
+            let note = if from_extra("--top-k") { "from extra" } else { "sampling default" };
+            rows.push(("top-k", v.to_string(), note.into()));
+        }
+        if let Some(v) = argv_value(argv, "--cache-reuse") {
+            rows.push(("cache-reuse", v.to_string(), "constant (off on hybrid SSM)".into()));
+        }
+        if argv.iter().any(|a| a == "--mmproj-auto") {
+            rows.push(("mmproj", "auto".into(), "vision without a projector path".into()));
+        }
+        if cfg.alias.is_none() {
+            rows.push(("alias", stem.clone(), "model file stem".into()));
+        }
+    }
+    if !rows.is_empty() {
+        println!();
+        println!("  DERIVED (computed by localmodel)");
+        for (k, v, note) in rows {
+            println!("  {:<14} {:<26} {}", k, truncate(&v, 24), note);
+        }
+    }
+    println!();
+}
+
 fn cmd_run(args: &[String]) -> i32 {
     let mut o = RunOpts::default();
     let mut i = 0;
@@ -2342,6 +2436,8 @@ fn cmd_run(args: &[String]) -> i32 {
             "--alias" => o.alias = val(&mut i),
             "--repl" => o.repl = true,
             "--dry-run" => o.dry_run = true,
+            "--explain" => o.explain = true,
+            "--strict" => o.strict = true,
             "--llama-help" => o.llama_help = true,
             "--help" | "-h" => {
                 help();
@@ -2390,7 +2486,8 @@ fn cmd_run(args: &[String]) -> i32 {
     if o.profile.is_some() && !saved.model.contains_key(&key) {
         eprintln!("warning: no settings profile '{key}', using defaults for {stem}");
     }
-    let cfg = Cfg::resolve(&o, &saved.for_model(&key));
+    let model_profile = saved.model.get(&key);
+    let (cfg, origins) = Cfg::explain(&o, &saved.defaults, model_profile);
     let alias = cfg.alias.clone().unwrap_or_else(|| stem.clone());
     let port = cfg.port.unwrap_or_else(|| server::free_port(8080));
 
@@ -2412,14 +2509,55 @@ fn cmd_run(args: &[String]) -> i32 {
             }
             _ => spec.model_path = Some(model.path.clone()),
         }
-        return run_strata(spec, Some(&model), &alias, cfg.ctx, port, o.repl, o.dry_run, &dir);
+        if o.explain {
+            print_explain(&model, &key, model_profile.is_some(), &cfg, &origins, port, None);
+        }
+        return run_strata(
+            spec,
+            Some(&model),
+            &alias,
+            cfg.ctx,
+            port,
+            o.repl,
+            o.dry_run || o.explain,
+            &dir,
+        );
     }
 
     let draft = models::find_draft(&model.path);
     let sv = build_args(&model, draft.as_deref(), &alias, port, &cfg);
 
+    // `extra` is the one open-ended channel; check its flags against the
+    // binary that will actually run, and say when it shadows a typed knob.
+    let issues = if o.explain || o.strict {
+        let active: Vec<&str> = origins.iter().map(|o| o.key).collect();
+        validate::check(&sv, cfg.extra.as_deref().unwrap_or(""), &bin, &active)
+    } else {
+        Vec::new()
+    };
+
+    // Provenance is only useful with the exact result it explains, so show
+    // the table first and the command after it.
+    if o.explain {
+        print_explain(&model, &key, model_profile.is_some(), &cfg, &origins, port, Some(&sv));
+        if !issues.is_empty() {
+            println!("  WARNINGS");
+            for w in &issues {
+                println!("  - {w}");
+            }
+            println!();
+        }
+    }
+    if o.strict && !issues.is_empty() {
+        eprintln!("settings check failed:");
+        for w in &issues {
+            eprintln!("  - {w}");
+        }
+        return 2;
+    }
+
     // Show the exact command instead of launching.
-    if o.dry_run {
+    if o.dry_run || o.explain {
         println!("{}", shell_cmd(&bin, &sv));
         return 0;
     }
@@ -3577,9 +3715,230 @@ fn edit_profile(p: &mut Profile, title: &str) -> bool {
 }
 
 /// `localmodel settings` — edit and persist launch settings.
+#[derive(Clone)]
+enum SettingsScope {
+    Defaults,
+    Model(String),
+}
+
+fn edit_values(prof: &mut Profile, sets: &[(String, String)], unsets: &[String]) -> bool {
+    for (k, v) in sets {
+        match prof.set(k, v) {
+            Ok(()) => println!("{k} = {}", prof.get(k).unwrap_or_default()),
+            Err(e) => {
+                eprintln!("{e}");
+                return false;
+            }
+        }
+    }
+    for k in unsets {
+        let had = prof.get(k).is_some();
+        match prof.set(k, "-") {
+            Ok(()) => println!("{k} unset{}", if had { "" } else { " (was not set)" }),
+            Err(e) => {
+                eprintln!("{e}");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Knob keys that have a value; used to tell "extra overrides this setting"
+/// from "extra duplicates an unset knob".
+fn active_keys(p: &Profile) -> Vec<&'static str> {
+    crate::knobs::KEYS
+        .iter()
+        .copied()
+        .filter(|k| p.get(k).is_some())
+        .collect()
+}
+
+fn warn_extra(p: &Profile) {
+    let Some(extra) = p.extra.as_deref() else { return };
+    let active = active_keys(p);
+    for w in crate::validate::check(&[], extra, &crate::config::server_bin(), &active) {
+        eprintln!("warning: {w}");
+    }
+}
+
+fn apply_settings(
+    st: &mut settings::Settings,
+    scope: &SettingsScope,
+    sets: &[(String, String)],
+    unsets: &[String],
+) -> i32 {
+    match scope {
+        SettingsScope::Defaults => {
+            let mut prof = st.defaults.clone();
+            if !edit_values(&mut prof, sets, unsets) {
+                return 1;
+            }
+            warn_extra(&prof);
+            st.defaults = prof;
+        }
+        SettingsScope::Model(name) => {
+            // Keep the spelling already in the file; only a brand-new profile
+            // takes the name as typed.
+            let key = settings::find_key(st, name)
+                .map(str::to_string)
+                .unwrap_or_else(|| name.clone());
+            let mut prof = st.model.get(&key).cloned().unwrap_or_default();
+            if !edit_values(&mut prof, sets, unsets) {
+                return 1;
+            }
+            if prof.is_empty() {
+                st.model.remove(&key);
+            } else {
+                // Shadowing is about the merged profile: a flag in extra can
+                // override a value inherited from [defaults] too.
+                let merged = st.defaults.overlay(&prof);
+                warn_extra(&merged);
+                st.model.insert(key, prof);
+            }
+        }
+    }
+    match settings::save(st) {
+        Ok(p) => {
+            println!("saved {}", p.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("failed to save settings: {e}");
+            1
+        }
+    }
+}
+
+/// `settings --show --origin`: the same provenance table as `run --explain`,
+/// but without CLI flags (there are none on this path).
+fn show_origins(st: &settings::Settings, scope: &SettingsScope) -> i32 {
+    match scope {
+        SettingsScope::Defaults => {
+            let (_, origins) = Cfg::explain(&RunOpts::default(), &st.defaults, None);
+            println!("scope    [defaults]");
+            println!("order    defaults > builtin > derived");
+            println!();
+            print_origin_rows(&origins);
+        }
+        SettingsScope::Model(name) => {
+            let Some(key) = settings::find_key(st, name) else {
+                eprintln!("no settings profile '{name}'");
+                eprintln!("scopes: localmodel settings --show");
+                return 1;
+            };
+            let (_, origins) =
+                Cfg::explain(&RunOpts::default(), &st.defaults, Some(&st.model[key]));
+            println!("scope    [model.\"{key}\"] over [defaults]");
+            println!("order    model > defaults > builtin > derived");
+            println!();
+            print_origin_rows(&origins);
+            // Show what this profile adds even when a value equals the
+            // builtin, so an empty profile is obvious at a glance.
+            let set_keys: Vec<&str> = crate::knobs::KEYS
+                .iter()
+                .copied()
+                .filter(|k| st.model[key].get(k).is_some())
+                .collect();
+            if set_keys.is_empty() {
+                println!("\n  {DIM}this profile sets no values{RESET}");
+            }
+        }
+    }
+    0
+}
+
 fn cmd_settings(args: &[String]) -> i32 {
     let mut st = settings::load();
-    let show = args.iter().any(|a| a == "--show" || a == "-s");
+    let mut show = false;
+    let mut origin = false;
+    let mut scope: Option<SettingsScope> = None;
+    let mut sets: Vec<(String, String)> = Vec::new();
+    let mut unsets: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let val = |i: &mut usize| -> Option<String> {
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        match a {
+            "--show" | "-s" => show = true,
+            "--origin" => origin = true,
+            "--defaults" => {
+                if matches!(scope, Some(SettingsScope::Model(_))) {
+                    eprintln!("choose either --defaults or --model NAME, not both");
+                    return 2;
+                }
+                scope = Some(SettingsScope::Defaults);
+            }
+            "--model" => {
+                let Some(name) = val(&mut i) else {
+                    eprintln!("--model needs a name");
+                    return 2;
+                };
+                if matches!(scope, Some(SettingsScope::Defaults)) {
+                    eprintln!("choose either --defaults or --model NAME, not both");
+                    return 2;
+                }
+                scope = Some(SettingsScope::Model(name));
+            }
+            "--set" => {
+                let Some(kv) = val(&mut i) else {
+                    eprintln!("--set needs key=value");
+                    return 2;
+                };
+                let Some((k, v)) = kv.split_once('=') else {
+                    eprintln!("--set needs key=value, got '{kv}'");
+                    return 2;
+                };
+                if k.trim().is_empty() {
+                    eprintln!("--set needs a setting name before '='");
+                    return 2;
+                }
+                sets.push((k.trim().to_string(), v.to_string()));
+            }
+            "--unset" => {
+                let Some(k) = val(&mut i) else {
+                    eprintln!("--unset needs a setting name");
+                    return 2;
+                };
+                unsets.push(k.trim().to_string());
+            }
+            "--help" | "-h" => {
+                help();
+                return 0;
+            }
+            other => {
+                eprintln!("settings: unknown option '{other}'");
+                eprintln!("usage: localmodel settings [--show]");
+                eprintln!(
+                    "       localmodel settings (--defaults | --model NAME) --set key=value [--set ...] [--unset key]"
+                );
+                eprintln!("       localmodel settings (--defaults | --model NAME) --show --origin");
+                return 2;
+            }
+        }
+        i += 1;
+    }
+
+    let mutate = !sets.is_empty() || !unsets.is_empty();
+    if mutate || origin {
+        let Some(scope) = scope.clone() else {
+            eprintln!("choose a scope: --model NAME or --defaults");
+            return 2;
+        };
+        if mutate {
+            return apply_settings(&mut st, &scope, &sets, &unsets);
+        }
+        return show_origins(&st, &scope);
+    }
+    if scope.is_some() {
+        eprintln!("--model/--defaults only apply to --set, --unset and --show --origin");
+        return 2;
+    }
+
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if show || !tty {
         print_settings(&st);
