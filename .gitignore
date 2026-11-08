@@ -1,0 +1,11 @@
+# build output
+/target/
+
+# local, machine-specific notes: measurements, VRAM numbers, "why this profile"
+# They live next to the code but are personal, so they never go upstream.
+NOTES.local.md
+
+# logs, OS and editor noise
+*.log
+*.swp
+.DS_Store
