@@ -1,24 +1,255 @@
-//! "Will it fit?" estimates for the Strata model families.
+//! "Will it fit?" estimates for models on this machine.
 //!
-//! The numbers are the published ones from Strata's docs/MODELS.md and
-//! docs/QWEN36.md, turned into arithmetic for *this* machine:
+//! Two calculators live here:
 //!
-//!   * Qwen3.6-35B-A3B runs in hybrid mode: the engine keeps every expert it
-//!     can in VRAM and computes the rest from RAM.
-//!   * Qwen3.8-Flash-Next keeps shard 1's experts in RAM; the GPU holds the
-//!     dense part. Without enough RAM it only runs in low-RAM mode, which the
-//!     docs say needs 32 GB of RAM and a 24 GB card (or the Coder pack).
-//!   * Gyro is quoted as VRAM + RAM together.
+//!   * `estimate` reads the published Strata tables and models the hybrid
+//!     VRAM/RAM split those packs use:
+//!
+//!       * Qwen3.6-35B-A3B runs in hybrid mode: the engine keeps every expert
+//!         it can in VRAM and computes the rest from RAM.
+//!       * Qwen3.8-Flash-Next keeps shard 1's experts in RAM; the GPU holds
+//!         the dense part. Without enough RAM it only runs in low-RAM mode,
+//!         which the docs say needs 32 GB of RAM and a 24 GB card (or the
+//!         Coder pack).
+//!       * Gyro is quoted as VRAM + RAM together.
+//!
+//!   * `for_gguf` reads the file's own GGUF metadata: block count, attention
+//!     layer layout, KV heads, head dimensions and sliding windows. That is
+//!     what the hub uses before a model has ever been launched.
+//!
+//! The Strata numbers are published ones from docs/MODELS.md and
+//! docs/QWEN36.md. The GGUF constants are calibrated on this box (see
+//! `COMPUTE_GB`).
 //!
 //! Everything here is an estimate. It is deliberately conservative: a "fits"
 //! means the model should load with the desktop running, not that it will be
 //! fast.
+#![allow(dead_code)] // the phase-3 hub consumes the GGUF calculator; tests cover it now.
+#![allow(dead_code)] // the phase-3 hub consumes the GGUF calculator; tests cover it now.
 
 use std::path::Path;
 
+use crate::gguf;
 use crate::server;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+/// GGUF weights grow a little when loaded (alignment, duplicated tied
+/// embeddings, the output tensor). Measured 7.04 GiB file → ~7.11 GiB resident.
+const WEIGHT_LOAD_FACTOR: f64 = 1.01;
+/// Compute buffers (graph, logits, batch) and the CUDA context, together.
+/// Calibrated 2026-11-08 on this box against Ornith-1.5-9B-Q6_K at 262144
+/// tokens, q8_0/q8_0 with the built-in MTP head: weights 7.11 + KV 4.78 +
+/// 1.55 = 13.44 GiB, while llama-server reported 14009 MiB (13.68 GiB).
+/// The 0.24 GiB gap is inside the "fits" margin on purpose; the verdict is
+/// meant to be conservative, not exact to the last frame.
+const COMPUTE_GB: f64 = 1.25;
+const CUDA_CTX_GB: f64 = 0.30;
+/// Less than this much free VRAM after loading counts as "tight".
+const TIGHT_GB: f64 = 1.0;
+
+/// Context sizes worth suggesting. llama.cpp handles the 2^n sizes best;
+/// 196608 is the 3×65536 step that Qwen-family models use.
+const CTX_STEPS: &[u32] = &[4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144];
+
+/// Bytes per KV-cache element for a llama.cpp `--cache-type-*` name.
+///
+/// Block formats from ggml: q8_0 packs 32 values in 34 bytes, q5_1 in 24,
+/// q5_0 in 22, q4_1 in 20, q4_0/iq4_nl in 18; q6_k is 210 bytes per 256.
+/// f16/bf16 are plain 2-byte elements.
+pub fn kv_type_bytes(name: &str) -> f64 {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "f16" | "fp16" | "bf16" => 2.0,
+        "q8_0" => 1.0625,
+        "q6_k" => 0.820_3125,
+        "q5_1" => 0.75,
+        "q5_0" => 0.6875,
+        "q4_1" => 0.625,
+        "q4_0" | "iq4_nl" => 0.5625,
+        _ => 2.0,
+    }
+}
+
+/// A draft context to add on top of the main model.
+///
+/// For a built-in MTP head pass `meta.kv.draft` with `weights_bytes = 0`
+/// (the head is already inside the main file). For an external draft model
+/// pass that file's `kv.main` and its file size.
+#[derive(Clone, Copy)]
+pub struct DraftKv<'a> {
+    pub layers: &'a [gguf::KvLayer],
+    pub swa_window: u32,
+    pub weights_bytes: u64,
+    pub ctk: &'a str,
+    pub ctv: &'a str,
+}
+
+/// KV bytes at `ctx` for one set of layers. Sliding-window layers stop
+/// growing once the window is full; that is why a 262K Gemma context does not
+/// cost 256× the KV of a 1K one.
+fn layer_bytes(
+    layers: &[gguf::KvLayer],
+    swa_window: u32,
+    ctx: u32,
+    k_bpe: f64,
+    v_bpe: f64,
+) -> f64 {
+    layers
+        .iter()
+        .map(|l| {
+            let tokens = if l.swa && swa_window > 0 {
+                swa_window.min(ctx) as f64
+            } else {
+                ctx as f64
+            };
+            let heads = l.heads as f64;
+            tokens * heads * (l.k as f64 * k_bpe + l.v as f64 * v_bpe)
+        })
+        .sum()
+}
+
+fn kv_usage_gb(
+    meta: &gguf::Meta,
+    draft: Option<&DraftKv>,
+    ctx: u32,
+    ctk: &str,
+    ctv: &str,
+) -> (f64, f64) {
+    let main = layer_bytes(
+        &meta.kv.main,
+        meta.kv.swa_window,
+        ctx,
+        kv_type_bytes(ctk),
+        kv_type_bytes(ctv),
+    ) / GIB;
+    let draft = draft
+        .map(|d| {
+            layer_bytes(
+                d.layers,
+                d.swa_window,
+                ctx,
+                kv_type_bytes(d.ctk),
+                kv_type_bytes(d.ctv),
+            ) / GIB
+        })
+        .unwrap_or(0.0);
+    (main, draft)
+}
+
+/// VRAM estimate computed from the GGUF metadata itself.
+pub struct GgufEstimate {
+    pub verdict: Verdict,
+    pub ctx: u32,
+    pub weights_gb: f64,
+    pub kv_main_gb: f64,
+    pub kv_draft_gb: f64,
+    pub overhead_gb: f64,
+    pub need_vram_gb: f64,
+    /// VRAM the card may use for planning (total minus the desktop baseline).
+    pub room_gb: f64,
+    /// Average KV cost of one token at this context, for display.
+    pub kv_gb_per_token: f64,
+    pub why: String,
+}
+
+/// Estimate VRAM for a GGUF file from its own metadata.
+///
+/// `weights_bytes` is the file size (for a sharded model, the sum of parts).
+/// `draft` accounts for the MTP/nextn context; pass `None` when speculative
+/// decoding is off.
+///
+/// Assumes every layer is on the GPU (`-ngl 99`). For an MoE model running
+/// with `--n-cpu-moe`, subtract the offloaded expert bytes from
+/// `weights_bytes` before calling; the per-tensor split belongs to the hub.
+pub fn for_gguf(
+    meta: &gguf::Meta,
+    weights_bytes: u64,
+    hw: &Hardware,
+    ctx: u32,
+    ctk: &str,
+    ctv: &str,
+    draft: Option<DraftKv<'_>>,
+) -> GgufEstimate {
+    let draft_weights = draft.map(|d| d.weights_bytes).unwrap_or(0);
+    let weights_gb = (weights_bytes.saturating_add(draft_weights)) as f64 / GIB * WEIGHT_LOAD_FACTOR;
+    let (kv_main_gb, kv_draft_gb) = kv_usage_gb(meta, draft.as_ref(), ctx, ctk, ctv);
+    let overhead_gb = COMPUTE_GB + CUDA_CTX_GB;
+    let need_vram_gb = weights_gb + kv_main_gb + kv_draft_gb + overhead_gb;
+    let room_gb = hw.vram_room_gb();
+
+    let (verdict, why) = if hw.vram_total_gb <= 0.0 {
+        (Verdict::No, "no GPU memory detected".to_string())
+    } else if !meta.kv.has_kv() {
+        (
+            Verdict::No,
+            "KV geometry is missing from the GGUF metadata".to_string(),
+        )
+    } else {
+        let slack = room_gb - need_vram_gb;
+        let verdict = if slack >= TIGHT_GB {
+            Verdict::Fits
+        } else if slack >= 0.0 {
+            Verdict::Tight
+        } else {
+            Verdict::No
+        };
+        let mut why = format!(
+            "{:.1} GB weights + {:.1} GB KV + {:.1} GB overhead = {:.1} GB of {:.1} GB usable",
+            weights_gb, kv_main_gb + kv_draft_gb, overhead_gb, need_vram_gb, room_gb
+        );
+        if slack >= 0.0 {
+            why.push_str(&format!("; {:.1} GB spare", slack));
+        } else {
+            why.push_str(&format!("; {:.1} GB short", -slack));
+        }
+        (verdict, why)
+    };
+
+    GgufEstimate {
+        verdict,
+        ctx,
+        weights_gb,
+        kv_main_gb,
+        kv_draft_gb,
+        overhead_gb,
+        need_vram_gb,
+        room_gb,
+        kv_gb_per_token: (kv_main_gb + kv_draft_gb) * GIB / ctx.max(1) as f64,
+        why,
+    }
+}
+
+/// Largest standard context size that still fits, capped by the model's
+/// training context. 0 means even the smallest step does not fit.
+pub fn suggest_ctx(
+    meta: &gguf::Meta,
+    weights_bytes: u64,
+    hw: &Hardware,
+    ctk: &str,
+    ctv: &str,
+    draft: Option<DraftKv<'_>>,
+) -> u32 {
+    let draft_weights = draft.map(|d| d.weights_bytes).unwrap_or(0);
+    let weights_gb = (weights_bytes.saturating_add(draft_weights)) as f64 / GIB * WEIGHT_LOAD_FACTOR;
+    let overhead_gb = COMPUTE_GB + CUDA_CTX_GB;
+    let room_gb = hw.vram_room_gb();
+    let cap = if meta.ctx_train > 0 { meta.ctx_train } else { u32::MAX };
+
+    // Steps are few, so brute-force the descending list instead of inventing
+    // an inverse formula that would have to special-case sliding windows.
+    for &step in CTX_STEPS.iter().rev() {
+        if step > cap {
+            continue;
+        }
+        let (main, draft_gb) = kv_usage_gb(meta, draft.as_ref(), step, ctk, ctv);
+        if weights_gb + overhead_gb + main + draft_gb <= room_gb {
+            return step;
+        }
+    }
+    0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Verdict {
     Fits,
     Tight,
@@ -351,4 +582,146 @@ pub fn command(e: &CatalogEntry, ctx: u32) -> String {
         "strata launch --family {family} --model {} --context {} --kv int8 --vision off --tune skip --yes --no-tui",
         e.size, ctx
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::{KvGeometry, KvLayer, Meta};
+
+    fn hw(vram_total_gb: f64) -> Hardware {
+        Hardware {
+            ram_total_gb: 64.0,
+            ram_avail_gb: 32.0,
+            vram_total_gb,
+            disk_free_gb: 2000.0,
+        }
+    }
+
+    fn attn(heads: u32, k: u32, v: u32, swa: bool) -> KvLayer {
+        KvLayer { heads, k, v, swa }
+    }
+
+    /// The real Ornith-1.5-9B layout: 33 blocks, every 4th is full attention
+    /// (8), one built-in MTP block (1), 4 KV heads of 256 elements.
+    fn ornith_9b() -> Meta {
+        Meta {
+            layers: 33,
+            quant: "Q6_K".into(),
+            nextn: true,
+            arch: "qwen35".into(),
+            block_count: 33,
+            ctx_train: 262144,
+            nextn_layers: 1,
+            kv: KvGeometry {
+                main: vec![attn(4, 256, 256, false); 8],
+                draft: vec![attn(4, 256, 256, false)],
+                swa_window: 0,
+            },
+        }
+    }
+
+    fn builtin_draft<'a>(meta: &'a Meta, ctk: &'a str, ctv: &'a str) -> DraftKv<'a> {
+        DraftKv {
+            layers: &meta.kv.draft,
+            swa_window: meta.kv.swa_window,
+            weights_bytes: 0,
+            ctk,
+            ctv,
+        }
+    }
+
+    #[test]
+    fn kv_type_sizes_match_ggml_blocks() {
+        assert_eq!(kv_type_bytes("f16"), 2.0);
+        assert_eq!(kv_type_bytes("bf16"), 2.0);
+        assert_eq!(kv_type_bytes("q8_0"), 1.0625);
+        assert!((kv_type_bytes("q6_k") - 0.8203125).abs() < 1e-9);
+        assert_eq!(kv_type_bytes("q4_0"), 0.5625);
+        assert_eq!(kv_type_bytes("IQ4_NL"), 0.5625);
+        // Unknown names fall back to the safe (largest) assumption.
+        assert_eq!(kv_type_bytes("nope"), 2.0);
+    }
+
+    #[test]
+    fn ornith_9b_kv_matches_the_measurement() {
+        // 7558901696 bytes = 7.04 GiB Q6_K file; measured 14009 MiB VRAM.
+        let meta = ornith_9b();
+        let e = for_gguf(
+            &meta,
+            7_558_901_696,
+            &hw(15.5),
+            262144,
+            "q8_0",
+            "q8_0",
+            Some(builtin_draft(&meta, "q8_0", "q8_0")),
+        );
+        // The plan's check: 9 attention layers (8 main + 1 MTP) at q8_0.
+        assert!((e.kv_main_gb - 4.25).abs() < 0.02, "main KV {}", e.kv_main_gb);
+        assert!((e.kv_draft_gb - 0.53125).abs() < 0.02, "draft KV {}", e.kv_draft_gb);
+        assert!((e.kv_main_gb + e.kv_draft_gb - 4.78).abs() < 0.06);
+        assert_eq!(e.verdict, Verdict::Fits);
+        assert!(e.need_vram_gb > 13.0 && e.need_vram_gb < 14.0, "{}", e.need_vram_gb);
+    }
+
+    #[test]
+    fn ornith_9b_ctx_suggestion_respects_the_card() {
+        let meta = ornith_9b();
+        let draft = builtin_draft(&meta, "q8_0", "q8_0");
+        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(15.5), "q8_0", "q8_0", Some(draft)), 262144);
+        // A 12 GB card leaves ~11.1 GiB; after 7.1 weights and 1.55 overhead
+        // only ~2.4 GiB is left, which is the 131072 step, not 262144.
+        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(12.0), "q8_0", "q8_0", Some(draft)), 131072);
+        // An 8 GB card cannot hold the weights at all.
+        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(8.0), "q8_0", "q8_0", Some(draft)), 0);
+    }
+
+    #[test]
+    fn sliding_window_layers_stop_growing() {
+        // Gemma-ish: 5 sliding-window blocks and one full-attention block.
+        let mut layers = vec![attn(8, 256, 256, true); 5];
+        layers.push(attn(1, 512, 512, false));
+        let bytes = layer_bytes(&layers, 1024, 262144, 1.0625, 1.0625) / GIB;
+        // Full block: 1 GiB * 262144/1024 / 512 ≈ 0.266 GiB;
+        // window blocks: 5 * 8 / 1... ≈ 0.021 GiB. Total ≈ 0.286 GiB.
+        assert!((bytes - 0.2864).abs() < 0.01, "gemma KV {bytes}");
+    }
+
+    #[test]
+    fn asymmetric_kv_types_are_priced_separately() {
+        let meta = Meta {
+            layers: 1,
+            quant: "Q8_0".into(),
+            nextn: false,
+            arch: "test".into(),
+            block_count: 1,
+            ctx_train: 131072,
+            nextn_layers: 0,
+            kv: KvGeometry { main: vec![attn(8, 128, 128, false)], draft: vec![], swa_window: 0 },
+        };
+        let mixed = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "q8_0", "f16", None);
+        let q8_both = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "q8_0", "q8_0", None);
+        // V in f16 is almost twice the size of V in q8_0, so the mixed cache
+        // must be bigger than q8_0/q8_0, and smaller than f16/f16.
+        assert!(mixed.kv_main_gb > q8_both.kv_main_gb);
+        let f16_both = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "f16", "f16", None);
+        assert!(mixed.kv_main_gb < f16_both.kv_main_gb);
+    }
+
+    #[test]
+    fn missing_kv_metadata_is_not_a_false_fits() {
+        let meta = Meta {
+            layers: 32,
+            quant: "Q4_K".into(),
+            nextn: false,
+            arch: "unknown".into(),
+            block_count: 32,
+            ctx_train: 4096,
+            nextn_layers: 0,
+            kv: KvGeometry::default(),
+        };
+        let e = for_gguf(&meta, 4 << 30, &hw(24.0), 4096, "q8_0", "q8_0", None);
+        assert_eq!(e.verdict, Verdict::No);
+        assert!(e.why.contains("KV geometry"));
+    }
 }
