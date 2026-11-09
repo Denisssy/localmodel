@@ -24,9 +24,6 @@
 //! Everything here is an estimate. It is deliberately conservative: a "fits"
 //! means the model should load with the desktop running, not that it will be
 //! fast.
-#![allow(dead_code)] // the phase-3 hub consumes the GGUF calculator; tests cover it now.
-#![allow(dead_code)] // the phase-3 hub consumes the GGUF calculator; tests cover it now.
-
 use std::path::Path;
 
 use crate::gguf;
@@ -149,6 +146,9 @@ pub struct GgufEstimate {
     pub room_gb: f64,
     /// Average KV cost of one token at this context, for display.
     pub kv_gb_per_token: f64,
+    /// One-line explanation; the hub renders its own breakdown and the tests
+    /// assert on this wording.
+    #[allow(dead_code)]
     pub why: String,
 }
 

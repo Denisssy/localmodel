@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// fields, serde form, `is_empty` and `overlay` stay in sync by construction.
 pub use crate::knobs::Profile;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     #[serde(skip_serializing_if = "Profile::is_empty")]

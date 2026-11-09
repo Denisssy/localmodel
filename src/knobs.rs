@@ -13,7 +13,6 @@
 //!
 //! Adding a setting now is one row. Keep the row order: it is also the order
 //! of keys in `settings.toml`, so saved profiles stay diff-free.
-#![allow(dead_code)] // KNOBS / get / set / Caps are consumed by `settings --set` (phase 1) and `hub` (phase 3).
 
 use serde::{Deserialize, Serialize};
 
@@ -21,8 +20,8 @@ use serde::{Deserialize, Serialize};
 pub const KV_TYPES: [&str; 9] = ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl", "q6_k"];
 const KV_ENUM: &[&str] = &KV_TYPES;
 
-/// Reasoning-effort values the templates understand; empty string = unset.
-pub const EFFORTS: [&str; 6] = ["", "high", "xhigh", "medium", "low", "off"];
+/// Reasoning-effort values the templates understand (`""` means unset and is
+/// not offered as a choice; `-` in the hub clears the override).
 const EFFORT_ENUM: &[&str] = &["high", "xhigh", "medium", "low", "off"];
 
 /// Where a knob belongs on the hub screen.
@@ -101,8 +100,6 @@ pub enum Applies {
     All,
     /// MoE only: `--n-cpu-moe` does nothing for a dense model.
     Moe,
-    /// Built-in MTP head (`blk.N.nextn.*`).
-    Nextn,
     /// Any speculative decoding: built-in MTP or an external draft file.
     Draft,
     /// Vision input (mmproj).
@@ -124,7 +121,6 @@ impl Applies {
         match self {
             Applies::All => true,
             Applies::Moe => c.moe,
-            Applies::Nextn => c.nextn,
             Applies::Draft => c.nextn || c.draft,
             Applies::Vision => c.vision,
         }
@@ -302,7 +298,7 @@ profile_knobs! {
         , Group::Context
         , Kind::Num { min: 256, max: 8_388_608, unit: "tok" }
         , Applies::All
-        , "-c"
+        , "--ctx-size"
         , "Context window in tokens. KV memory grows linearly with it.";
     ctk : String
         , "KV cache K"
@@ -344,7 +340,7 @@ profile_knobs! {
         , Group::Speed
         , Kind::Num { min: 1, max: 256, unit: "" }
         , Applies::All
-        , "-t"
+        , "--threads"
         , "CPU threads; physical cores usually beat SMT siblings.";
     reasoning : String
         , "reasoning"
@@ -495,6 +491,34 @@ mod tests {
     }
 
     #[test]
+    fn applies_filter_matches_model_caps() {
+        let visible = |c: Caps| -> Vec<&'static str> {
+            KNOBS
+                .iter()
+                .filter(|k| k.applies.check(&c))
+                .map(|k| k.key)
+                .collect()
+        };
+        let dense = Caps::default();
+        let shown = visible(dense);
+        assert!(!shown.contains(&"ncmoe"), "ncmoe leaked into a dense model");
+        assert!(!shown.contains(&"draft_tokens"), "draft leaked without a draft");
+        assert!(!shown.contains(&"mmproj"), "vision leaked without an mmproj");
+        assert!(shown.contains(&"ctx") && shown.contains(&"ctk"));
+
+        let moe = Caps { moe: true, ..Caps::default() };
+        assert!(visible(moe).contains(&"ncmoe"));
+
+        let mtp = Caps { nextn: true, draft: true, ..Caps::default() };
+        assert!(visible(mtp).contains(&"draft_tokens"));
+        assert!(visible(mtp).contains(&"draft_gpu"));
+
+        let vision = Caps { vision: true, ..Caps::default() };
+        assert!(visible(vision).contains(&"vision"));
+        assert!(visible(vision).contains(&"mmproj"));
+    }
+
+    #[test]
     fn overlay_covers_every_knob() {
         let mut base = Profile::default();
         let mut over = Profile::default();
@@ -558,6 +582,5 @@ mod tests {
         assert!(!Applies::Draft.check(&dense));
         assert!(Applies::Moe.check(&moe_mtp));
         assert!(Applies::Draft.check(&moe_mtp));
-        assert!(Applies::Nextn.check(&moe_mtp));
     }
 }

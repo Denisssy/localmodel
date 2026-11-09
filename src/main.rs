@@ -3,6 +3,7 @@ mod download;
 mod engine;
 mod fit;
 mod gguf;
+mod hub;
 mod jinja;
 mod knobs;
 mod models;
@@ -26,7 +27,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
 use dialoguer::theme::ColorfulTheme;
-use dialoguer::{Input, Select};
+use dialoguer::Select;
 use serde_json::{json, Value};
 
 use models::Model;
@@ -183,6 +184,7 @@ fn main() {
             }
             None => cmd_run(&args[1..]),
         },
+        Some("hub") => hub::cmd_hub(&args[1..]),
         Some("strata") => cmd_strata(&args[1..]),
         Some("doctor") | Some("fit") => cmd_doctor(&args[1..]),
         Some("info") | Some("show") => cmd_info(&args[1..]),
@@ -214,6 +216,7 @@ fn help() {
 
 USAGE:
   localmodel                      pick a model from the list and launch it
+  localmodel hub                  models + their launch settings on one screen
   localmodel run <model> [opts]   launch a model by name substring or index
   localmodel run <family>/<size>  same hub, Strata engine (e.g. qwen36/ud-q4_k_xl)
   localmodel strata <family> <size>  launch a Strata catalog model
@@ -264,11 +267,13 @@ RUN OPTIONS:
 
 The dashboard is the default on a TTY: the card stays put, stats update in
 place, and these keys work without leaving it:
-  ?  h    help            s    session settings (edit, save, apply & restart)
+  ?  h    help            s    hint to use `localmodel hub`
   l       toggle the log  r    restart         q  Esc  Ctrl-C   stop and quit
-`localmodel params` lists the flags you can pass via --extra without digging
-through llama.cpp docs. `localmodel settings` saves the values you would
-otherwise retype: global defaults, per-model overrides and per-pack overrides
+`localmodel hub` is the one place to see a model, edit only the knobs that
+apply to it, preview the argv and launch it. `localmodel params` lists the
+flags you can pass via --extra without digging through llama.cpp docs.
+`localmodel settings` saves the same values non-interactively: global
+defaults, per-model overrides and per-pack overrides
 for Strata hub entries ([model.\"qwen36/ud_q4_k_xl\"]), applied automatically by
 `run` and the picker. CLI flags always win over saved settings.
 
@@ -578,6 +583,7 @@ fn cmd_info(args: &[String]) -> i32 {
             experts_total: info.experts_total,
             experts_active: info.experts_active,
             nextn: false,
+            meta: gguf::Meta::default(),
         };
         let engine = info.engine_label();
         let launch = format!("localmodel strata {} {}", info.family, info.size);
@@ -794,24 +800,28 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
         a.push(k.to_string());
         a.push(v.to_string());
     };
+    // Flag spelling comes from the registry, so `validate::check` (which
+    // reads `knob.argv` to spot shadowing `extra`) and the hub's argv panel
+    // agree with what is actually launched.
+    let f = |key: &str| knobs::knob(key).map(|k| k.argv).unwrap_or("");
     push(&mut a, "-m", &m.path.display().to_string());
-    push(&mut a, "--alias", alias);
-    push(&mut a, "--ctx-size", &c.ctx.to_string());
+    push(&mut a, f("alias"), alias);
+    push(&mut a, f("ctx"), &c.ctx.to_string());
     push(&mut a, "--parallel", "1");
-    push(&mut a, "--flash-attn", if c.flash_attn { "on" } else { "off" });
-    push(&mut a, "--cache-type-k", &c.ctk);
-    push(&mut a, "--cache-type-v", &c.ctv);
-    push(&mut a, "--temp", &c.temp.to_string());
-    push(&mut a, "--top-p", &c.top_p.to_string());
-    push(&mut a, "--host", &c.host);
-    push(&mut a, "--port", &port.to_string());
+    push(&mut a, f("flash_attn"), if c.flash_attn { "on" } else { "off" });
+    push(&mut a, f("ctk"), &c.ctk);
+    push(&mut a, f("ctv"), &c.ctv);
+    push(&mut a, f("temp"), &c.temp.to_string());
+    push(&mut a, f("top_p"), &c.top_p.to_string());
+    push(&mut a, f("host"), &c.host);
+    push(&mut a, f("port"), &port.to_string());
     a.push("--jinja".to_string());
     // Multimodal vision: Gemma 4 Unified needs an external mmproj projector
     // file for llama.cpp. Pass --mmproj when configured, otherwise rely on
     // --mmproj-auto.
     if c.vision {
         if let Some(p) = &c.mmproj {
-            a.push("--mmproj".to_string());
+            a.push(f("mmproj").to_string());
             a.push(p.clone());
         } else {
             a.push("--mmproj-auto".to_string());
@@ -836,13 +846,13 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             .clone()
             .or_else(|| default_effort(cp));
         if let Some(kw) = jinja::effort_kwargs(cp, effort.as_deref()) {
-            push(&mut a, "--chat-template-kwargs", &kw.to_string());
+            push(&mut a, f("effort"), &kw.to_string());
         }
     }
 
     if n.contains("nemotron") {
-        push(&mut a, "-ngl", &c.ngl.unwrap_or(999).to_string());
-        push(&mut a, "--n-cpu-moe", &c.ncmoe.unwrap_or(58).to_string());
+        push(&mut a, f("ngl"), &c.ngl.unwrap_or(999).to_string());
+        push(&mut a, f("ncmoe"), &c.ncmoe.unwrap_or(58).to_string());
         let extra = c.extra.as_deref().unwrap_or("");
         let has_flag = |f: &str| {
             extra
@@ -858,12 +868,12 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
         if let Some(d) = draft {
             push(&mut a, "--spec-type", "draft-dflash");
             push(&mut a, "--spec-draft-model", &d.display().to_string());
-            push(&mut a, "--spec-draft-ngl", "999");
-            push(&mut a, "--spec-draft-n-max", &c.draft_tokens.unwrap_or(7).to_string());
+            push(&mut a, f("draft_gpu"), "999");
+            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
         }
     } else if m.moe {
-        push(&mut a, "-ngl", &c.ngl.unwrap_or(99).to_string());
-        push(&mut a, "--n-cpu-moe", &c.ncmoe.unwrap_or(58).to_string());
+        push(&mut a, f("ngl"), &c.ngl.unwrap_or(99).to_string());
+        push(&mut a, f("ncmoe"), &c.ncmoe.unwrap_or(58).to_string());
         // As in the dense branch: `extra` may override the batch sizes, so
         // only emit the defaults when the profile did not.
         let extra = c.extra.as_deref().unwrap_or("");
@@ -883,15 +893,15 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             // target model itself, so there is no --spec-draft-model to pass.
             // The nextn experts land where the CPU-MoE split puts them.
             push(&mut a, "--spec-type", "draft-mtp");
-            push(&mut a, "--spec-draft-n-max", &c.draft_tokens.unwrap_or(3).to_string());
+            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(3).to_string());
         } else if let Some(d) = draft {
             push(&mut a, "--spec-type", "draft-dflash");
             push(&mut a, "--spec-draft-model", &d.display().to_string());
-            push(&mut a, "--spec-draft-ngl", "999");
-            push(&mut a, "--spec-draft-n-max", &c.draft_tokens.unwrap_or(7).to_string());
+            push(&mut a, f("draft_gpu"), "999");
+            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
         }
     } else {
-        push(&mut a, "-ngl", &c.ngl.unwrap_or(99).to_string());
+        push(&mut a, f("ngl"), &c.ngl.unwrap_or(99).to_string());
         // Default batch sizes; a profile's `extra` may override them, so do
         // not emit a duplicate that only makes the dry-run command confusing.
         let extra = c.extra.as_deref().unwrap_or("");
@@ -923,7 +933,7 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             // so there is no --spec-draft-model, -ngl or -device to pass.
             // n-max 3 measured 40-44 tok/s on a 4060 Ti 16 GB at 32K (n=1: ~30).
             push(&mut a, "--spec-type", "draft-mtp");
-            push(&mut a, "--spec-draft-n-max", &c.draft_tokens.unwrap_or(3).to_string());
+            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(3).to_string());
         } else if let Some(d) = draft {
             // External draft head (older models without a built-in MTP layer).
             // Qwen3.8 MTP head on the CPU, the same split Strata does in
@@ -939,29 +949,29 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
                 // Draft on the GPU: only fits with a small context (32-48K
                 // with q4 KV). Decode gains ~30% since the CPU draft no
                 // longer competes with prefill for threads.
-                push(&mut a, "--spec-draft-ngl", "999");
+                push(&mut a, f("draft_gpu"), "999");
             } else {
-                push(&mut a, "--spec-draft-ngl", "0");
+                push(&mut a, f("draft_gpu"), "0");
                 push(&mut a, "--spec-draft-device", "none");
             }
             // A standalone MTP head predicts exactly one token ahead; asking
             // for more means chaining the head through itself. One draft
             // token per step is the sweet spot there.
             let n = c.draft_tokens.unwrap_or(if is_mtp { 1 } else { 7 });
-            push(&mut a, "--spec-draft-n-max", &n.to_string());
+            push(&mut a, f("draft_tokens"), &n.to_string());
         }
     }
 
     if let Some(r) = &c.reasoning {
-        push(&mut a, "--reasoning", r);
+        push(&mut a, f("reasoning"), r);
     }
     if let Some(t) = c.threads {
-        push(&mut a, "--threads", &t.to_string());
+        push(&mut a, f("threads"), &t.to_string());
     }
     if let Some(t) = &c.tools {
         // llama.cpp built-in agent tools (file/shell access). Off by default:
         // the server is unauthenticated and bound to localhost only.
-        push(&mut a, "--tools", t);
+        push(&mut a, f("tools"), t);
     }
     if let Some(e) = &c.extra {
         for p in e.split_whitespace() {
@@ -1075,6 +1085,7 @@ fn run_strata(
             experts_total: 256,
             experts_active: 8,
             nextn: false,
+            meta: gguf::Meta::default(),
         },
     };
 
@@ -1181,7 +1192,8 @@ fn strata_dashboard(
         let ram = ram_text(0);
         let (cols, rows) = screen_size();
         let screen = render_screen(
-            model, info, &snapshot, gpu.as_ref(), &ram, logpath, show_logs, frame, cols, rows,
+            model, info, &snapshot, gpu.as_ref(), &ram, logpath, show_logs, frame, None, cols,
+            rows,
         );
         print!("\x1b[H{}\x1b[J", screen.replace('\n', "\r\n"));
         let _ = out.flush();
@@ -1873,6 +1885,7 @@ fn render_screen(
     logpath: &Path,
     show_logs: bool,
     frame: usize,
+    hint: Option<&str>,
     cols: usize,
     rows: usize,
 ) -> String {
@@ -2042,10 +2055,16 @@ fn render_screen(
         body.truncate(budget.saturating_sub(1));
         body.push(format!("  {DIM}window too small - resize{RESET}"));
     }
+    if let Some(h) = hint {
+        if body.len() >= budget {
+            body.pop();
+        }
+        body.push(format!("  {GREEN}{h}{RESET}"));
+    }
 
     let title = format!("{dot}●{RESET} {} :{}", info.alias, info.port);
     let footer = format!(
-        "{DIM}? help · s settings · l log · r restart · q quit{RESET}\n  {DIM}API http://127.0.0.1:{}/v1  ·  log {}{RESET}",
+        "{DIM}? help · s where settings moved · l log · r restart · q quit{RESET}\n  {DIM}API http://127.0.0.1:{}/v1  ·  log {}{RESET}",
         info.port,
         logpath.display()
     );
@@ -2872,218 +2891,11 @@ impl Session {
     }
 }
 
+/// Two states are enough now that the settings editor lives in `hub.rs`:
+/// the live card and its key reference.
 enum View {
     Main,
     Help,
-    Settings(SettingsView),
-}
-
-struct SettingsView {
-    idx: usize,
-    edit: Option<String>,
-    /// True right after Enter: the first typed character replaces the value
-    /// instead of appending to it.
-    fresh: bool,
-    cfg: Cfg,
-    msg: Option<String>,
-}
-
-enum SettingAction {
-    None,
-    Save,
-    Back,
-    Restart,
-}
-
-const SETTINGS_FIELDS: usize = 20;
-
-fn cycle_kv(cur: &mut String) {
-    let i = KV_TYPES.iter().position(|t| *t == cur).unwrap_or(2);
-    *cur = KV_TYPES[(i + 1) % KV_TYPES.len()].to_string();
-}
-
-fn cycle_effort(cur: &mut Option<String>) {
-    const EFFORTS: [&str; 6] = ["", "high", "xhigh", "medium", "low", "off"];
-    let cur_s = cur.clone().unwrap_or_default();
-    let i = EFFORTS.iter().position(|t| *t == cur_s).unwrap_or(0);
-    let next = EFFORTS[(i + 1) % EFFORTS.len()];
-    *cur = if next.is_empty() { None } else { Some(next.to_string()) };
-}
-
-fn non_empty(t: String) -> Option<String> {
-    if t.is_empty() {
-        None
-    } else {
-        Some(t)
-    }
-}
-
-fn commit_edit(v: &mut SettingsView) {
-    let Some(buf) = v.edit.take() else { return };
-    let t = buf.trim().to_string();
-    match v.idx {
-        0 => {
-            if let Ok(x) = t.parse() {
-                v.cfg.ctx = x;
-            }
-        }
-        3 => v.cfg.ngl = t.parse().ok(),
-        4 => v.cfg.ncmoe = t.parse().ok(),
-        5 => v.cfg.port = t.parse().ok(),
-        6 => v.cfg.threads = t.parse().ok(),
-        7 => v.cfg.reasoning = non_empty(t),
-        8 => v.cfg.extra = non_empty(t),
-        9 => v.cfg.alias = non_empty(t),
-        11 => {
-            if let Ok(x) = t.parse() {
-                v.cfg.temp = x;
-            }
-        }
-        12 => {
-            if let Ok(x) = t.parse() {
-                v.cfg.top_p = x;
-            }
-        }
-        13 => {
-            v.cfg.host = if t.is_empty() {
-                "127.0.0.1".to_string()
-            } else {
-                t
-            };
-        }
-        15 => v.cfg.draft_tokens = t.parse().ok(),
-        16 => v.cfg.tools = non_empty(t),
-        _ => {}
-    }
-}
-
-fn begin_edit(v: &mut SettingsView, text: String) {
-    v.edit = Some(text);
-    v.fresh = true;
-}
-
-fn handle_settings(v: &mut SettingsView, key: KeyEvent) -> SettingAction {
-    if v.edit.is_some() {
-        match key.code {
-            KeyCode::Enter => {
-                commit_edit(v);
-                v.fresh = false;
-            }
-            KeyCode::Esc => {
-                v.edit = None;
-                v.fresh = false;
-            }
-            KeyCode::Backspace => {
-                if let Some(b) = v.edit.as_mut() {
-                    if v.fresh {
-                        b.clear();
-                        v.fresh = false;
-                    } else {
-                        b.pop();
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(b) = v.edit.as_mut() {
-                    if v.fresh {
-                        b.clear();
-                        v.fresh = false;
-                    }
-                    b.push(c);
-                }
-            }
-            _ => {}
-        }
-        return SettingAction::None;
-    }
-
-    match key.code {
-        KeyCode::Esc => return SettingAction::Back,
-        KeyCode::Up | KeyCode::Char('k') => v.idx = v.idx.saturating_sub(1),
-        KeyCode::Down | KeyCode::Char('j') => v.idx = (v.idx + 1).min(SETTINGS_FIELDS + 2),
-        KeyCode::Enter => match v.idx {
-            0 => begin_edit(v, v.cfg.ctx.to_string()),
-            1 => cycle_kv(&mut v.cfg.ctk),
-            2 => cycle_kv(&mut v.cfg.ctv),
-            3 => begin_edit(v, v.cfg.ngl.map(|x| x.to_string()).unwrap_or_default()),
-            4 => begin_edit(v, v.cfg.ncmoe.map(|x| x.to_string()).unwrap_or_default()),
-            5 => begin_edit(v, v.cfg.port.map(|x| x.to_string()).unwrap_or_default()),
-            6 => begin_edit(v, v.cfg.threads.map(|x| x.to_string()).unwrap_or_default()),
-            7 => begin_edit(v, v.cfg.reasoning.clone().unwrap_or_default()),
-            8 => begin_edit(v, v.cfg.extra.clone().unwrap_or_default()),
-            9 => begin_edit(v, v.cfg.alias.clone().unwrap_or_default()),
-            10 => v.cfg.flash_attn = !v.cfg.flash_attn,
-            11 => begin_edit(v, v.cfg.temp.to_string()),
-            12 => begin_edit(v, v.cfg.top_p.to_string()),
-            13 => begin_edit(v, v.cfg.host.clone()),
-            14 => cycle_effort(&mut v.cfg.effort),
-            15 => begin_edit(v, v.cfg.draft_tokens.map(|x| x.to_string()).unwrap_or_default()),
-            16 => begin_edit(v, v.cfg.tools.clone().unwrap_or_default()),
-            17 => v.cfg.draft_gpu = !v.cfg.draft_gpu,
-            18 => v.cfg.vision = !v.cfg.vision,
-            19 => begin_edit(v, v.cfg.mmproj.clone().unwrap_or_default()),
-            20 => return SettingAction::Restart,
-            21 => return SettingAction::Save,
-            _ => return SettingAction::Back,
-        },
-        _ => {}
-    }
-    SettingAction::None
-}
-
-fn persist_cfg(cfg: &Cfg, model: &Model) -> std::io::Result<PathBuf> {
-    let mut st = settings::load();
-    st.model.insert(
-        models::stem(&model.name),
-        Profile {
-            applies_to: None,
-            ctx: Some(cfg.ctx),
-            ctk: Some(cfg.ctk.clone()),
-            ctv: Some(cfg.ctv.clone()),
-            ngl: cfg.ngl,
-            ncmoe: cfg.ncmoe,
-            port: cfg.port,
-            threads: cfg.threads,
-            reasoning: cfg.reasoning.clone(),
-            effort: cfg.effort.clone(),
-            draft_tokens: cfg.draft_tokens,
-            draft_gpu: if cfg.draft_gpu { Some(true) } else { None },
-            vision: Some(cfg.vision),
-            mmproj: cfg.mmproj.clone(),
-            extra: cfg.extra.clone(),
-            tools: cfg.tools.clone(),
-            alias: cfg.alias.clone(),
-            flash_attn: Some(cfg.flash_attn),
-            temp: Some(cfg.temp),
-            top_p: Some(cfg.top_p),
-            host: Some(cfg.host.clone()),
-        },
-    );
-    settings::save(&mut st)
-}
-
-fn opt_num<T: std::fmt::Display>(v: Option<T>) -> String {
-    v.map(|x| x.to_string()).unwrap_or_else(|| "auto".to_string())
-}
-
-fn row_line(v: &SettingsView, idx: usize, label: &str, value: &str) -> String {
-    let mark = if idx == v.idx {
-        format!("{CYAN}❯{RESET}")
-    } else {
-        " ".to_string()
-    };
-    if idx >= SETTINGS_FIELDS {
-        return format!(" {mark} {GREEN}{}{RESET}", label);
-    }
-    let shown = if idx == v.idx {
-        match &v.edit {
-            Some(buf) => format!("{buf}▌"),
-            None => value.to_string(),
-        }
-    } else {
-        value.to_string()
-    };
-    format!(" {mark} {DIM}{label:<18}{RESET}{shown}")
 }
 
 fn render_help(info: &Info, cols: usize) -> String {
@@ -3091,14 +2903,15 @@ fn render_help(info: &Info, cols: usize) -> String {
         String::new(),
         section("KEYS"),
         format!("  {GREEN}?  h{RESET}      this help"),
-        format!("  {GREEN}s{RESET}         session settings (apply & restart)"),
+        format!("  {GREEN}s{RESET}         where settings moved (hub)"),
         format!("  {GREEN}l{RESET}         show / hide the log panel"),
         format!("  {GREEN}r{RESET}         restart the server"),
         format!("  {GREEN}q  Esc{RESET}    stop the server and quit"),
         format!("  {GREEN}Ctrl-C{RESET}    stop the server and quit"),
         String::new(),
-        section("SAVED SETTINGS"),
-        format!("  {GREEN}localmodel settings{RESET}   defaults + per-model profiles"),
+        section("SETTINGS"),
+        format!("  {GREEN}localmodel hub{RESET}        model list + its knobs, save & launch"),
+        format!("  {GREEN}localmodel settings{RESET}   non-interactive --set / --show --origin"),
         format!("  {GREEN}localmodel params{RESET}     llama.cpp flag cheat sheet"),
         String::new(),
         section("NOTES"),
@@ -3114,112 +2927,16 @@ fn render_help(info: &Info, cols: usize) -> String {
     )
 }
 
-fn render_settings(info: &Info, v: &SettingsView, cols: usize, rows: usize) -> String {
-    let fields: [(&str, String); SETTINGS_FIELDS] = [
-        ("context size", v.cfg.ctx.to_string()),
-        ("KV cache K", v.cfg.ctk.clone()),
-        ("KV cache V", v.cfg.ctv.clone()),
-        ("GPU layers", opt_num(v.cfg.ngl)),
-        ("experts on CPU", opt_num(v.cfg.ncmoe)),
-        ("port", opt_num(v.cfg.port)),
-        ("threads", opt_num(v.cfg.threads)),
-        (
-            "reasoning",
-            v.cfg
-                .reasoning
-                .clone()
-                .unwrap_or_else(|| "model default".to_string()),
-        ),
-        (
-            "extra flags",
-            v.cfg.extra.clone().unwrap_or_else(|| "none".to_string()),
-        ),
-        (
-            "alias",
-            v.cfg.alias.clone().unwrap_or_else(|| "model name".to_string()),
-        ),
-        (
-            "flash attention",
-            if v.cfg.flash_attn { "on" } else { "off" }.to_string(),
-        ),
-        ("temperature", v.cfg.temp.to_string()),
-        ("top-p", v.cfg.top_p.to_string()),
-        ("host", v.cfg.host.clone()),
-        (
-            "reasoning effort",
-            v.cfg
-                .effort
-                .clone()
-                .unwrap_or_else(|| "auto".to_string()),
-        ),
-        ("draft tokens", opt_num(v.cfg.draft_tokens)),
-        (
-            "tools",
-            v.cfg.tools.clone().unwrap_or_else(|| "off".to_string()),
-        ),
-        ("draft on GPU", if v.cfg.draft_gpu { "yes".to_string() } else { "no".to_string() }),
-        ("vision input", if v.cfg.vision { "on" } else { "off" }.to_string()),
-        (
-            "mmproj path",
-            v.cfg.mmproj.clone().unwrap_or_else(|| "(auto)".to_string()),
-        ),
-    ];
-    let mut items: Vec<Option<(usize, String, String)>> = fields
-        .iter()
-        .enumerate()
-        .map(|(i, (label, value))| Some((i, label.to_string(), value.clone())))
-        .collect();
-    items.push(None);
-    items.push(Some((SETTINGS_FIELDS, "apply & restart".into(), String::new())));
-    items.push(Some((SETTINGS_FIELDS + 1, "save to settings".into(), String::new())));
-    items.push(Some((SETTINGS_FIELDS + 2, "back".into(), String::new())));
-
-    // Scroll the list so the cursor stays visible in short terminals.
-    let avail = rows.saturating_sub(8).max(4);
-    let pos = items
-        .iter()
-        .position(|it| matches!(it, Some((i, _, _)) if *i == v.idx))
-        .unwrap_or(0);
-    let start = if items.len() > avail {
-        pos.saturating_sub(avail / 2).min(items.len() - avail)
-    } else {
-        0
-    };
-    let end = (start + avail).min(items.len());
-
-    let mut body = vec![String::new()];
-    if start > 0 {
-        body.push(format!("  {DIM}... more above{RESET}"));
-    }
-    for it in &items[start..end] {
-        match it {
-            None => body.push(String::new()),
-            Some((i, label, value)) => body.push(row_line(v, *i, label, value)),
-        }
-    }
-    if end < items.len() {
-        body.push(format!("  {DIM}... more below{RESET}"));
-    }
-    if let Some(m) = &v.msg {
-        body.push(String::new());
-        body.push(format!("  {GREEN}{m}{RESET}"));
-    }
-    let hint = if v.edit.is_some() {
-        "type to replace · Enter confirm · Esc cancel"
-    } else {
-        "Up/Down move · Enter edit/cycle/run · Esc back"
-    };
-    boxed(
-        &format!("{CYAN}{BOLD}settings{RESET} {DIM}{}{RESET}", info.alias),
-        &body,
-        &format!("{DIM}{hint}{RESET}"),
-        cols,
-    )
-}
-
 /// Apply one key press to the current view. Returns true when the dashboard
-/// should shut down.
-fn handle_key(s: &mut Session, view: &mut View, show_logs: &mut bool, k: KeyEvent) -> bool {
+/// should shut down. `hint` is a one-frame message under the card (used by
+/// `s`, which no longer opens a settings editor: that is `localmodel hub`).
+fn handle_key(
+    s: &mut Session,
+    view: &mut View,
+    show_logs: &mut bool,
+    hint: &mut Option<String>,
+    k: KeyEvent,
+) -> bool {
     // Ctrl-C / Ctrl-D quit; Enter may arrive as \n when input is piped.
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('d'))
@@ -3231,18 +2948,16 @@ fn handle_key(s: &mut Session, view: &mut View, show_logs: &mut bool, k: KeyEven
     } else {
         k
     };
+    *hint = None;
     let mut next: Option<View> = None;
     match view {
         View::Main => match k.code {
             KeyCode::Char('?') | KeyCode::Char('h') => next = Some(View::Help),
             KeyCode::Char('s') => {
-                next = Some(View::Settings(SettingsView {
-                    idx: 0,
-                    edit: None,
-                    fresh: false,
-                    cfg: s.cfg.clone(),
-                    msg: None,
-                }))
+                *hint = Some(
+                    "settings moved: run `localmodel hub`, edit the model's row, then `s` or `L`"
+                        .to_string(),
+                );
             }
             KeyCode::Char('l') => *show_logs = !*show_logs,
             KeyCode::Char('r') => {
@@ -3256,21 +2971,6 @@ fn handle_key(s: &mut Session, view: &mut View, show_logs: &mut bool, k: KeyEven
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('h') => next = Some(View::Main),
             KeyCode::Char('q') => return true,
             _ => {}
-        },
-        View::Settings(v) => match handle_settings(v, k) {
-            SettingAction::Back => next = Some(View::Main),
-            SettingAction::Restart => {
-                let cfg = v.cfg.clone();
-                match s.restart(&cfg) {
-                    Ok(()) => next = Some(View::Main),
-                    Err(e) => v.msg = Some(format!("restart failed: {e}")),
-                }
-            }
-            SettingAction::Save => match persist_cfg(&v.cfg, &s.model) {
-                Ok(p) => v.msg = Some(format!("saved {}", p.display())),
-                Err(e) => v.msg = Some(format!("save failed: {e}")),
-            },
-            SettingAction::None => {}
         },
     }
     if let Some(v) = next {
@@ -3289,6 +2989,7 @@ fn run_dashboard(mut s: Session) -> i32 {
 
     let mut view = View::Main;
     let mut show_logs = true;
+    let mut hint: Option<String> = None;
     let mut frame = 0usize;
     let mut exit_status = None;
 
@@ -3309,11 +3010,11 @@ fn run_dashboard(mut s: Session) -> i32 {
                 &s.logpath,
                 show_logs,
                 frame,
+                hint.as_deref(),
                 cols,
                 rows,
             ),
             View::Help => render_help(&s.info, cols),
-            View::Settings(v) => render_settings(&s.info, v, cols, rows),
         };
         // Every line is clipped to the terminal width, so nothing wraps and
         // there is no leftover text to smear; \x1b[J clears the rest.
@@ -3333,7 +3034,7 @@ fn run_dashboard(mut s: Session) -> i32 {
         if event::poll(Duration::from_millis(500)).unwrap_or(false) {
             loop {
                 if let Ok(Event::Key(k)) = event::read() {
-                    if handle_key(&mut s, &mut view, &mut show_logs, k) {
+                    if handle_key(&mut s, &mut view, &mut show_logs, &mut hint, k) {
                         quit = true;
                     }
                 }
@@ -3541,179 +3242,6 @@ fn cmd_params(args: &[String]) -> i32 {
     0
 }
 
-fn show_opt<T: std::fmt::Display>(v: &Option<T>, fallback: &str) -> String {
-    v.as_ref()
-        .map(|x| x.to_string())
-        .unwrap_or_else(|| fallback.to_string())
-}
-
-/// Prompt for a value. Enter keeps the current one, `-` clears it.
-/// `Err(())` means the user cancelled (Ctrl-C / Esc).
-fn ask(label: &str, cur: Option<String>, hint: &str) -> Result<Option<String>, ()> {
-    let input: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt(format!("{label}  {DIM}{hint}{RESET}"))
-        .with_initial_text(cur.unwrap_or_default())
-        .allow_empty(true)
-        .interact_text()
-        .map_err(|_| ())?;
-    let v = input.trim();
-    if v == "-" {
-        Ok(None)
-    } else if v.is_empty() {
-        Ok(Some(String::new()))
-    } else {
-        Ok(Some(v.to_string()))
-    }
-}
-
-fn edit_num<T>(cur: &mut Option<T>, label: &str) -> bool
-where
-    T: std::str::FromStr + std::fmt::Display + Clone,
-{
-    match ask(label, cur.as_ref().map(|v| v.to_string()), "'-' = auto") {
-        Err(()) => false,
-        Ok(None) => {
-            *cur = None;
-            true
-        }
-        Ok(Some(s)) if s.is_empty() => true,
-        Ok(Some(s)) => match s.parse::<T>() {
-            Ok(v) => {
-                *cur = Some(v);
-                true
-            }
-            Err(_) => {
-                println!("  ignoring '{s}': not a valid value");
-                true
-            }
-        },
-    }
-}
-
-fn edit_str(cur: &mut Option<String>, label: &str) -> bool {
-    match ask(label, cur.clone(), "'-' = unset") {
-        Err(()) => false,
-        Ok(None) => {
-            *cur = None;
-            true
-        }
-        Ok(Some(s)) if s.is_empty() => true,
-        Ok(Some(s)) => {
-            *cur = Some(s);
-            true
-        }
-    }
-}
-
-const KV_TYPES: [&str; 9] = knobs::KV_TYPES;
-
-fn edit_kv(cur: &mut Option<String>, label: &str) -> bool {
-    let mut items: Vec<String> = KV_TYPES.iter().map(|s| s.to_string()).collect();
-    items.push("reset to default".to_string());
-    let def = cur
-        .as_deref()
-        .and_then(|c| KV_TYPES.iter().position(|t| *t == c))
-        .unwrap_or(2);
-    match Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(label)
-        .items(&items)
-        .default(def)
-        .interact()
-    {
-        Ok(i) if i < KV_TYPES.len() => {
-            *cur = Some(KV_TYPES[i].to_string());
-            true
-        }
-        Ok(_) => {
-            *cur = None;
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-fn edit_bool(cur: &mut Option<bool>, label: &str) -> bool {
-    let def = if cur.unwrap_or(true) { 0 } else { 1 };
-    match Select::with_theme(&ColorfulTheme::default())
-        .with_prompt(label)
-        .items(&["on", "off", "reset to default"])
-        .default(def)
-        .interact()
-    {
-        Ok(0) => {
-            *cur = Some(true);
-            true
-        }
-        Ok(1) => {
-            *cur = Some(false);
-            true
-        }
-        Ok(_) => {
-            *cur = None;
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-fn edit_profile(p: &mut Profile, title: &str) -> bool {
-    loop {
-        let items = vec![
-            format!("context size       {}", show_opt(&p.ctx, "131072")),
-            format!("KV cache K         {}", show_opt(&p.ctk, "q8_0")),
-            format!("KV cache V         {}", show_opt(&p.ctv, "same as K")),
-            format!("GPU layers         {}", show_opt(&p.ngl, "auto")),
-            format!("experts on CPU     {}", show_opt(&p.ncmoe, "auto")),
-            format!("port               {}", show_opt(&p.port, "auto")),
-            format!("threads            {}", show_opt(&p.threads, "auto")),
-            format!("reasoning          {}", show_opt(&p.reasoning, "model default")),
-            format!("extra flags        {}", show_opt(&p.extra, "none")),
-            format!("alias              {}", show_opt(&p.alias, "model name")),
-            format!(
-                "flash attention    {}",
-                p.flash_attn
-                    .map(|b| if b { "on" } else { "off" })
-                    .unwrap_or("on (default)")
-            ),
-            format!("temperature        {}", show_opt(&p.temp, "1.0")),
-            format!("top-p              {}", show_opt(&p.top_p, "0.95")),
-            format!("host               {}", show_opt(&p.host, "127.0.0.1")),
-            "save & exit".to_string(),
-            "cancel".to_string(),
-        ];
-        let choice = match Select::with_theme(&ColorfulTheme::default())
-            .with_prompt(format!("{title} - settings"))
-            .items(&items)
-            .default(0)
-            .interact()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        let ok = match choice {
-            0 => edit_num(&mut p.ctx, "Context size (tokens)"),
-            1 => edit_kv(&mut p.ctk, "KV cache type for K"),
-            2 => edit_kv(&mut p.ctv, "KV cache type for V"),
-            3 => edit_num(&mut p.ngl, "GPU layers"),
-            4 => edit_num(&mut p.ncmoe, "MoE experts kept on CPU"),
-            5 => edit_num(&mut p.port, "Port"),
-            6 => edit_num(&mut p.threads, "CPU threads"),
-            7 => edit_str(&mut p.reasoning, "Reasoning (on / off)"),
-            8 => edit_str(&mut p.extra, "Extra engine flags (e.g. --mtp off)"),
-            9 => edit_str(&mut p.alias, "Served alias"),
-            10 => edit_bool(&mut p.flash_attn, "Flash attention"),
-            11 => edit_num(&mut p.temp, "Temperature"),
-            12 => edit_num(&mut p.top_p, "Top-p"),
-            13 => edit_str(&mut p.host, "Host"),
-            14 => return true,
-            _ => return false,
-        };
-        if !ok {
-            return false;
-        }
-    }
-}
-
 /// `localmodel settings` — edit and persist launch settings.
 #[derive(Clone)]
 enum SettingsScope {
@@ -3850,7 +3378,6 @@ fn show_origins(st: &settings::Settings, scope: &SettingsScope) -> i32 {
 
 fn cmd_settings(args: &[String]) -> i32 {
     let mut st = settings::load();
-    let mut show = false;
     let mut origin = false;
     let mut scope: Option<SettingsScope> = None;
     let mut sets: Vec<(String, String)> = Vec::new();
@@ -3864,7 +3391,7 @@ fn cmd_settings(args: &[String]) -> i32 {
             args.get(*i).cloned()
         };
         match a {
-            "--show" | "-s" => show = true,
+            "--show" | "-s" => {}
             "--origin" => origin = true,
             "--defaults" => {
                 if matches!(scope, Some(SettingsScope::Model(_))) {
@@ -3939,75 +3466,8 @@ fn cmd_settings(args: &[String]) -> i32 {
         return 2;
     }
 
-    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if show || !tty {
-        print_settings(&st);
-        return 0;
-    }
-
-    let ms = models::scan(&config::models_dir());
-    let mut scopes: Vec<String> = vec!["defaults (all models)".to_string()];
-    for m in &ms {
-        let s = models::stem(&m.name);
-        if !scopes.contains(&s) {
-            scopes.push(s);
-        }
-    }
-    // Strata hub packs are settings scopes too: key = family/size.
-    for (fam, size) in strata_packs() {
-        let k = format!("{fam}/{size}");
-        if !scopes.iter().any(|s| settings::norm_key(s) == settings::norm_key(&k)) {
-            scopes.push(k);
-        }
-    }
-    for k in st.model.keys() {
-        if !scopes.iter().any(|s| settings::norm_key(s) == settings::norm_key(k)) {
-            scopes.push(k.clone());
-        }
-    }
-
-    let idx = match Select::with_theme(&ColorfulTheme::default())
-        .with_prompt("Edit settings for")
-        .items(&scopes)
-        .default(0)
-        .interact()
-    {
-        Ok(i) => i,
-        Err(_) => return 1,
-    };
-    let scope = if idx == 0 { None } else { Some(scopes[idx].clone()) };
-    let mut prof = match &scope {
-        None => st.defaults.clone(),
-        Some(k) => settings::find_key(&st, k)
-            .and_then(|key| st.model.get(key).cloned())
-            .unwrap_or_default(),
-    };
-    let title = scope.clone().unwrap_or_else(|| "defaults".to_string());
-
-    if !edit_profile(&mut prof, &title) {
-        println!("cancelled, nothing saved");
-        return 0;
-    }
-    match &scope {
-        None => st.defaults = prof,
-        Some(k) => {
-            // Keep one entry per pack: replace the same key spelled another way.
-            if let Some(old) = settings::find_key(&st, k).map(str::to_string) {
-                st.model.remove(&old);
-            }
-            st.model.insert(k.clone(), prof);
-        }
-    }
-    match settings::save(&mut st) {
-        Ok(p) => {
-            println!("saved {}", p.display());
-            0
-        }
-        Err(e) => {
-            eprintln!("failed to save settings: {e}");
-            1
-        }
-    }
+    print_settings(&st);
+    0
 }
 
 fn print_settings(st: &settings::Settings) {
@@ -4027,7 +3487,7 @@ fn print_settings(st: &settings::Settings) {
             }
         }
     }
-    println!("\n{DIM}edit: localmodel settings  ·  CLI flags override saved values{RESET}");
+    println!("\n{DIM}edit: localmodel hub (or settings --set)  ·  CLI flags override saved values{RESET}");
 }
 
 #[cfg(test)]
@@ -4049,6 +3509,7 @@ mod tests {
             experts_total: 0,
             experts_active: 0,
             nextn,
+            meta: gguf::Meta::default(),
         }
     }
 

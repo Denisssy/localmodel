@@ -79,12 +79,12 @@ pub struct KvGeometry {
 
 impl KvGeometry {
     /// True when at least one layer has enough metadata to size the cache.
-    #[allow(dead_code)] // used by fit::for_gguf, which the hub wires up in phase 3
     pub fn has_kv(&self) -> bool {
         self.main.iter().chain(self.draft.iter()).any(|l| l.heads > 0 && l.k > 0 && l.v > 0)
     }
 }
 
+#[derive(Clone, Default)]
 pub struct Meta {
     pub layers: u32,
     /// Dominant ggml tensor type, e.g. "IQ2_XXS", "Q4_K".

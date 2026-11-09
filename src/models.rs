@@ -20,6 +20,9 @@ pub struct Model {
     pub experts_active: u32,
     /// Built-in MTP head (`blk.N.nextn.*`) inside this GGUF.
     pub nextn: bool,
+    /// Full header metadata; the hub uses the KV geometry and context length
+    /// without reading the file again.
+    pub meta: gguf::Meta,
 }
 
 pub fn is_draft(name: &str) -> bool {
@@ -56,7 +59,7 @@ fn collect(dir: &Path, out: &mut Vec<Model>) {
         let size = e.metadata().map(|m| m.len()).unwrap_or(0);
         let meta = gguf::parse(&p);
         let name_quant = gguf::quant_from_name(&name);
-        let quant = if name_quant == "unknown" { meta.quant } else { name_quant };
+        let quant = if name_quant == "unknown" { meta.quant.clone() } else { name_quant };
         let quant = if quant.is_empty() { "unknown".to_string() } else { quant };
         let layers = meta.layers;
         let (moe, experts_total, experts_active) = detect_moe(&name);
@@ -70,6 +73,7 @@ fn collect(dir: &Path, out: &mut Vec<Model>) {
             experts_total,
             experts_active,
             nextn: meta.nextn,
+            meta,
         });
     }
 }
@@ -112,6 +116,27 @@ pub fn find_draft(model: &Path) -> Option<PathBuf> {
         }
         let dstem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         if dstem.starts_with(&stem) || stem.starts_with(&dstem) || dstem.contains(&base) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// The vision projector that sits next to `model`, if any.
+///
+/// Unsloth and llama.cpp repos name these `mmproj-<base>-<quant>.gguf` or
+/// `mmproj-<base>-f16.gguf`; there is usually exactly one per model folder, so
+/// the first match wins. `scan` hides mmproj files (`is_draft`), so this is the
+/// only way the hub can offer `vision = true` without a typed path.
+pub fn find_mmproj(model: &Path) -> Option<PathBuf> {
+    let dir = model.parent()?;
+    let rd = fs::read_dir(dir).ok()?;
+    for e in rd.flatten() {
+        let p = e.path();
+        let Some(name) = p.file_name().map(|s| s.to_string_lossy().to_lowercase()) else {
+            continue;
+        };
+        if name.contains("mmproj") && name.ends_with(".gguf") {
             return Some(p);
         }
     }
