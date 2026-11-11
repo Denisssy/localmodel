@@ -34,6 +34,7 @@ use crate::config;
 use crate::fit;
 use crate::gguf;
 use crate::knobs::{self, Caps, Group, Kind, Profile};
+use crate::mem;
 use crate::models::{self, Model};
 use crate::resolve::{Origin, Source};
 use crate::settings;
@@ -105,6 +106,7 @@ enum Row {
 }
 
 struct DraftInfo {
+    meta: gguf::Meta,
     layers: Vec<gguf::KvLayer>,
     swa: u32,
     weights: u64,
@@ -117,6 +119,12 @@ struct EstimateView {
     detail: String,
     ctx_max: u32,
     verdict: fit::Verdict,
+    /// MEMORY + PLACEMENT rows from `mem::plan`, same wording as the card.
+    mem: Vec<String>,
+    /// Effective values, so the settings list shows what will really be
+    /// passed instead of `auto`.
+    ngl: u32,
+    ncmoe: u32,
 }
 
 struct ArgvView {
@@ -452,13 +460,15 @@ impl Hub {
     // -- estimates --------------------------------------------------------
 
     fn draft_info(&mut self, m: &Model, cfg: &crate::Cfg) -> Option<DraftInfo> {
+        let (dctk, dctv) = fit::draft_kv_types(cfg);
         if m.nextn {
             return Some(DraftInfo {
+                meta: m.meta.clone(),
                 layers: m.meta.kv.draft.clone(),
                 swa: m.meta.kv.swa_window,
                 weights: 0,
-                ctk: cfg.ctk.clone(),
-                ctv: cfg.ctv.clone(),
+                ctk: dctk,
+                ctv: dctv,
             });
         }
         let path = models::find_draft(&m.path)?;
@@ -472,11 +482,12 @@ impl Hub {
             }
         };
         Some(DraftInfo {
+            meta: meta.clone(),
             layers: meta.kv.main.clone(),
             swa: meta.kv.swa_window,
             weights: bytes,
-            ctk: cfg.ctk.clone(),
-            ctv: cfg.ctv.clone(),
+            ctk: dctk,
+            ctv: dctv,
         })
     }
 
@@ -495,31 +506,107 @@ impl Hub {
             ctk: &d.ctk,
             ctv: &d.ctv,
         });
-        let e = fit::for_gguf(&m.meta, m.size, &self.hw, cfg.ctx, &cfg.ctk, &cfg.ctv, dref);
-        let ctx_max = fit::suggest_ctx(&m.meta, m.size, &self.hw, &cfg.ctk, &cfg.ctv, dref);
-        let spare = e.room_gb - e.need_vram_gb;
+        let e = fit::for_gguf(&m.meta, m.size, &self.hw, cfg.ctx, &cfg.ctk, &cfg.ctv, dref, cfg.kv_ram);
+        // The hub plans with the same code the running card uses. The built-in
+        // MTP head is already inside `m`, so only an external draft is passed.
+        let plan_draft = if m.nextn {
+            None
+        } else {
+            draft
+                .as_ref()
+                .map(|d| mem::Draft { meta: &d.meta, weights: d.weights })
+        };
+        // `fit` answers "does the whole model fit"; for a MoE with experts
+        // kept in RAM the answer is misleadingly "no". Use the actual
+        // placement for the verdict, the header numbers and the context cap.
+        let ctx_max = mem::max_ctx(
+            &m,
+            plan_draft.as_ref().map(|d| mem::Draft { meta: d.meta, weights: d.weights }),
+            &cfg,
+            &self.hw,
+        );
+        let plan = mem::plan(&m, plan_draft, &cfg, &self.hw);
+        let mut mem = vec![format!(
+            "{DIM}MEMORY{RESET}  {:.1} GiB VRAM · {:.1} GiB host  {DIM}({}){RESET}",
+            plan.vram_gb(),
+            plan.host.total_gb(),
+            if cfg.kv_ram { "KV in RAM" } else { "KV in VRAM" }
+        )];
+        mem.push(format!(
+            "{DIM}weights {:.1} · KV {:.1} · ovh {:.1} GiB{RESET}",
+            plan.total_weights_gb,
+            plan.kv_main_gb + plan.kv_draft_gb,
+            plan.overhead_gb
+        ));
+        for (name, val) in plan.place_rows() {
+            mem.push(format!("{DIM}{name:<6}{RESET} {val}"));
+        }
+        mem.push(format!(
+            "{DIM}offload{RESET}  -ngl {}/{} blocks · --n-cpu-moe {}",
+            plan.ngl, plan.block_count, plan.ncmoe
+        ));
+        if let Some(v) = &cfg.load_mode {
+            let note = match v.as_str() {
+                "none" => "weights in anonymous RAM, no SSD paging",
+                "mmap" | "mmap+mlock" => "experts paged from SSD on demand",
+                "mlock" => "kept in RAM, never swapped",
+                "dio" => "direct I/O, bypasses the page cache",
+                _ => "engine decides per device",
+            };
+            mem.push(format!("{DIM}load mode{RESET} {v}  {DIM}{note}{RESET}"));
+        }
+        if let Some(v) = cfg.moe_cache_mib {
+            mem.push(format!(
+                "{DIM}MoE cache{RESET} {v} MiB on GPU  {DIM}hot experts stay on the card{RESET}"
+            ));
+        }
+        if plan.ncmoe > 0 {
+            mem.push(format!(
+                "{DIM}         -ngl moves whole blocks; --n-cpu-moe moves only experts{RESET}"
+            ));
+            mem.push(format!(
+                "{YELLOW}         experts of blocks 0..{} stay in host RAM{RESET}",
+                plan.ncmoe
+            ));
+            mem.push(format!(
+                "{YELLOW}         mmap: those experts are read from SSD per token{RESET}"
+            ));
+            // Why `fit` says "no" while the placement fits: the fit number
+            // assumes every weight is on the card.
+            mem.push(format!(
+                "{DIM}         all on GPU: {:.1}/{:.1} GB ({}); {:.1}w + {:.1}kv + {:.1}ovh{RESET}",
+                e.need_vram_gb,
+                e.room_gb,
+                e.verdict.label(),
+                e.weights_gb,
+                e.kv_main_gb + e.kv_draft_gb,
+                e.overhead_gb,
+            ));
+        }
+        let need = plan.vram_gb();
+        let room = self.hw.vram_room_gb();
+        let verdict = fit::Verdict::for_slack(need, room);
+        let spare = room - need;
         let slack = if spare >= 0.0 {
             format!("{spare:.1} GB spare")
         } else {
             format!("{:.1} GB short", -spare)
         };
         self.est = Some(EstimateView {
-            line: format!(
-                "VRAM {:.1} / {:.1} GB  {}",
-                e.need_vram_gb,
-                e.room_gb,
-                e.verdict.label()
-            ),
+            line: format!("VRAM {:.1} / {:.1} GB  {}", need, room, verdict.label()),
             detail: format!(
                 "{} tok · {:.1} weights + {:.1} KV + {:.1} overhead · {:.0} KB/token · {slack}",
                 e.ctx,
-                e.weights_gb,
-                e.kv_main_gb + e.kv_draft_gb,
-                e.overhead_gb,
+                plan.total_weights_gb,
+                plan.kv_main_gb + plan.kv_draft_gb,
+                plan.overhead_gb,
                 e.kv_gb_per_token * 1024.0 * 1024.0,
             ),
             ctx_max,
-            verdict: e.verdict,
+            verdict,
+            mem,
+            ngl: plan.ngl,
+            ncmoe: plan.ncmoe,
         });
     }
 
@@ -849,7 +936,7 @@ impl Hub {
             self.render_panels(cols, rows)
         };
         let mut out = io::stdout();
-        let _ = write!(out, "\x1b[H{}\x1b[J", screen.replace('\n', "\r\n"));
+        let _ = write!(out, "{}", crate::paint_screen(&screen, cols));
         let _ = out.flush();
     }
 
@@ -860,7 +947,10 @@ impl Hub {
             .min(46)
             .min(cols.saturating_sub(20))
             .max(12);
-        let right_w = cols.saturating_sub(left_w).max(12);
+        let right_w = cols
+            .saturating_sub(left_w)
+            .saturating_sub(1)
+            .max(12);
 
         let left_body = self.left_body(left_w.saturating_sub(2), h.saturating_sub(3));
         let left_footer = format!("{} · Enter · x", "↑↓");
@@ -888,9 +978,7 @@ impl Hub {
                 None => "Enter apply · Esc cancel".to_string(),
             }
         } else if self.focus == Focus::Settings {
-            self.current_knob()
-                .map(|k| k.help.to_string())
-                .unwrap_or_else(|| "↑↓ knob · Enter edit · - reset · Tab panel".to_string())
+            "↑↓ knob · Enter edit · - reset · Tab panel".to_string()
         } else {
             "Enter opens this panel".to_string()
         };
@@ -1031,6 +1119,9 @@ impl Hub {
                     } else {
                         header.push(format!("{RED}ctx max for this card: none fits{RESET}"));
                     }
+                    for line in &e.mem {
+                        header.push(line.clone());
+                    }
                 } else {
                     header.push(format!(
                         "{YELLOW}no GGUF KV metadata: cannot estimate VRAM{RESET}"
@@ -1059,7 +1150,13 @@ impl Hub {
         }
 
         let rows = self.rows();
-        let avail = height.saturating_sub(header.len()).max(1);
+        // Reserve room at the bottom for a plain-language description of the
+        // selected knob. Without it the settings list says *what* a value is
+        // but never *what it does*, which is the whole point of the panel.
+        let about = self.about_lines(width, height.saturating_sub(header.len()));
+        let avail = height
+            .saturating_sub(header.len() + about.len())
+            .max(1);
         let start = window_start(rows.len(), self.row, avail);
         let (_, origins) = self.resolved();
         let mut body = header;
@@ -1067,7 +1164,33 @@ impl Hub {
             let idx = start + off;
             body.push(self.row_line(r, idx, &origins, width));
         }
+        body.extend(about);
         body
+    }
+
+    /// Short "what does this setting do" block for the selected knob, plus the
+    /// flag it maps to. Kept to a few lines so the list stays usable.
+    fn about_lines(&self, width: usize, height: usize) -> Vec<String> {
+        if self.focus != Focus::Settings {
+            return Vec::new();
+        }
+        let Some(k) = self.current_knob() else {
+            return Vec::new();
+        };
+        let inner = width.saturating_sub(2).max(20);
+        let wrapped = wrap(k.help, inner);
+        // Never eat more than half the panel; on a short terminal the help
+        // text loses its tail instead of hiding every row.
+        let room = height.saturating_sub(3).min(6).max(2);
+        let mut out = vec![String::new()];
+        out.push(format!(
+            "{CYAN}{BOLD}ABOUT{RESET}  {DIM}{}{RESET}",
+            if k.argv.is_empty() { "localmodel only" } else { k.argv }
+        ));
+        for l in wrapped.into_iter().take(room.saturating_sub(1)) {
+            out.push(format!("  {DIM}{l}{RESET}"));
+        }
+        out
     }
 
     fn row_line(&self, r: &Row, idx: usize, origins: &[Origin], _width: usize) -> String {
@@ -1080,10 +1203,28 @@ impl Hub {
                 } else {
                     " ".to_string()
                 };
-                let (value, src, note) = match origins.iter().find(|o| o.key == k.key) {
+                let (mut value, src, mut note) = match origins.iter().find(|o| o.key == k.key) {
                     Some(o) => (o.value.clone(), o.from, o.note),
                     None => ("auto".to_string(), Source::Builtin, ""),
                 };
+                // `ngl`/`ncmoe` have no builtin in `resolve` (the default
+                // depends on the model), so show what `build_args` will
+                // really pass and keep the "auto" note.
+                if value == "auto" {
+                    if let Some(est) = &self.est {
+                        match k.key {
+                            "ngl" => {
+                                value = est.ngl.to_string();
+                                note = "auto";
+                            }
+                            "ncmoe" => {
+                                value = est.ncmoe.to_string();
+                                note = "auto";
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let shown = if selected {
                     match &self.edit {
                         Some(e) => format!("{}▌", e.buf),

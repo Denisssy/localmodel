@@ -3,7 +3,8 @@
 План рефакторинга. Цель: любая настройка живёт в одном месте, видна с пояснением,
 редактируется без ручного TOML, а модель с HuggingFace приезжает уже настроенной.
 
-> **Статус.** Фазы 0–3 сделаны (2026-11-08/09). Фаза 0 — реестр `src/knobs.rs`.
+> **Статус.** Фазы 0–3 сделаны (2026-11-08/09), карточка памяти и раскладка по
+> картам — 2026-11-10. Фаза 0 — реестр `src/knobs.rs`.
 > Фаза 1 — `src/resolve.rs` (provenance), `run --explain`, `--strict`,
 > `settings --set/--unset/--show --origin`, `save()` на `toml_edit` (комментарии
 > и ручной порядок переживают сохранение), разбор файла по таблицам и проверка
@@ -16,6 +17,46 @@
 > написание общих флагов из `knob.argv` (веточные spec/batch-флаги остались
 > явными). argv всех 6 моделей по-прежнему побайтово совпадает с эталоном.
 > Дальше — фаза 4 (поток `add`).
+
+---
+
+## 0. Карточка памяти и раскладка по картам (2026-11-10)
+
+Карточка отвечает уже не «поместится ли», а «что где лежит». Три источника:
+
+1. **GGUF-таблица тензоров** (`gguf::Meta::block_bytes`, `block_expert_bytes`,
+   `input_bytes`, `output_bytes`). Парсер суммирует байты по `blk.N.*`,
+   отдельно `*_exps` и `token_embd`; размеры считаются по типу тензора
+   (`type_bytes_per_element`), а не по размеру файла.
+2. **Планировщик** `src/mem.rs`. Правила llama.cpp: `-ngl` — последние N
+   блоков, `--n-cpu-moe` — эксперты первых N, `token_embd` остаётся в RAM,
+   output едет с последним GPU-слоем, `--no-kv-offload` уводит KV в RAM.
+   Режимы `--split-mode layer|row|tensor|none` и `--tensor-split` дают
+   раскладку по двум картам; для каждой карты считаются веса, KV, compute и
+   CUDA-контекст, плюс диапазоны слоёв.
+3. **Лог llama.cpp** (`src/telemetry.rs`). При `--log-verbosity 4` движок
+   печатает таблицу `memory breakdown` (main и extra/draft) и строки
+   `model/KV/compute/RS buffer size`. Карточка показывает их как
+   «actual · llama.cpp startup log» и заменяет ими прогноз. Это отчёт о
+   фактической аллокации, а не live-телеметрия.
+
+Новые knob'ы реестра: `kv_ram` (`--no-kv-offload`, без значения),
+`split_mode` (`--split-mode`, default `layer`), `tensor_split`
+(`--tensor-split`) и `log_verbosity` (`--log-verbosity`, builtin `4`).
+`kv_ram`/`split_mode`/`tensor_split` попадают в argv только при отличии от
+дефолта, поэтому обычный argv не изменился; `--log-verbosity 4` печатается
+всегда, иначе breakdown неоткуда взять.
+
+Draft-контекст считается отдельно: у него свои `-ctkd`/`-ctvd` с дефолтом
+`f16`, и целевые `--cache-type-k/v` на него не распространяются. Если
+override лежит в `extra`, `fit::draft_kv_types` его находит; иначе карточка
+честно пишет `f16/f16` (для Ornith-9B при 262K это 1.00 GiB против 0.53 GiB,
+если ошибочно наследовать q8_0). `--n-cpu-moe` показывается как «experts in RAM:
+first N blocks», входной эмбеддинг — в строке Host RAM.
+
+Общие блоки `section`/`kv`/`boxed`/`memory_lines`/`gpu_lines` используют
+стартовая карточка, `localmodel info`, dashboard и шапка хаба — один формат,
+один расчёт. `ratatui` не добавлялся: текущий crossterm-рендер переиспользован.
 
 ---
 

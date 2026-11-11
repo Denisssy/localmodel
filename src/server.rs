@@ -12,6 +12,9 @@ pub fn free_port(start: u16) -> u16 {
 }
 
 pub struct GpuInfo {
+    /// Zero-based CUDA device index, i.e. the order llama.cpp prints CUDA0,
+    /// CUDA1, ... in its memory breakdown.
+    pub index: u32,
     pub name: String,
     pub util: f64,
     pub mem_used: f64,
@@ -21,30 +24,61 @@ pub struct GpuInfo {
     pub power_limit: f64,
 }
 
-pub fn gpu_info() -> Option<GpuInfo> {
-    let out = Command::new("nvidia-smi")
+/// Every visible CUDA device. `localmodel` has only ever needed the first
+/// card, but a second card changes both the launch flags and the card: each
+/// device gets its own row.
+pub fn gpu_infos() -> Vec<GpuInfo> {
+    let Ok(out) = Command::new("nvidia-smi")
         .args([
             "--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit",
             "--format=csv,noheader,nounits",
         ])
         .output()
-        .ok()?;
+    else {
+        return Vec::new();
+    };
     let s = String::from_utf8_lossy(&out.stdout);
-    let line = s.lines().next()?;
-    let p: Vec<&str> = line.split(',').map(|x| x.trim()).collect();
-    if p.len() < 7 {
+    s.lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let p: Vec<&str> = line.split(',').map(|x| x.trim()).collect();
+            if p.len() < 7 {
+                return None;
+            }
+            Some(GpuInfo {
+                index: i as u32,
+                name: p[0].to_string(),
+                util: p[1].parse().unwrap_or(0.0),
+                mem_used: p[2].parse().unwrap_or(0.0),
+                mem_total: p[3].parse().unwrap_or(0.0),
+                temp: p[4].parse().unwrap_or(0.0),
+                power_draw: p[5].parse().unwrap_or(0.0),
+                power_limit: p[6].parse().unwrap_or(0.0),
+            })
+        })
+        .collect()
+}
+
+pub fn gpu_info() -> Option<GpuInfo> {
+    gpu_infos().into_iter().next()
+}
+
+/// True when `nvidia-smi topo -m` reports an NVLink between any two cards.
+/// Two consumer cards normally show PCIe only; the card says so instead of
+/// implying that layer split between them is free.
+pub fn has_nvlink() -> Option<bool> {
+    let out = Command::new("nvidia-smi").args(["topo", "-m"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let gpu_rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("GPU"))
+        .collect();
+    if gpu_rows.len() < 2 {
         return None;
     }
-    Some(GpuInfo {
-        name: p[0].to_string(),
-        util: p[1].parse().unwrap_or(0.0),
-        mem_used: p[2].parse().unwrap_or(0.0),
-        mem_total: p[3].parse().unwrap_or(0.0),
-        temp: p[4].parse().unwrap_or(0.0),
-        power_draw: p[5].parse().unwrap_or(0.0),
-        power_limit: p[6].parse().unwrap_or(0.0),
-    })
+    Some(gpu_rows.iter().any(|l| l.split_whitespace().any(|c| c.starts_with("NV"))))
 }
+
 
 pub fn gpu_util() -> Option<f64> {
     let out = Command::new("nvidia-smi")
@@ -66,6 +100,7 @@ pub fn gpu_mem() -> Option<(f64, f64)> {
     let total: f64 = it.next()?.trim().parse().ok()?;
     Some((used, total))
 }
+
 
 /// Machine-wide RAM: `used = MemTotal - MemAvailable`, i.e. what tools like
 /// `free` and desktop monitors call "used". Page cache is *not* included.

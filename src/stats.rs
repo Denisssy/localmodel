@@ -9,6 +9,17 @@ pub struct Stats {
     pub pre_tokens: f64,
     pub pre_secs: f64,
     pub reqs: u64,
+    /// Last request's speculative draft acceptance (0..1) and mean accepted
+    /// length (tokens per verification step), parsed from the llama.cpp log.
+    pub last_draft_accept: Option<f64>,
+    pub last_draft_mean: Option<f64>,
+    /// Accepted tokens per draft position for the last request.
+    pub last_draft_per_pos: Vec<f64>,
+    /// Cumulative speculative counters from `/metrics` (used when the log
+    /// line is not available, e.g. after the log was rotated).
+    pub draft_tokens: f64,
+    pub accepted_tokens: f64,
+    pub draft_steps: f64,
 }
 
 fn num_before(s: &str, needle: &str) -> Option<f64> {
@@ -28,9 +39,58 @@ impl Stats {
     pub fn avg_dec(&self) -> Option<f64> {
         (self.dec_secs > 0.0).then(|| self.dec_tokens / self.dec_secs)
     }
+
+    /// Fraction of drafted tokens the target accepted (0..1).
+    pub fn draft_accept(&self) -> Option<f64> {
+        self.last_draft_accept.or_else(|| {
+            (self.draft_tokens > 0.0).then(|| self.accepted_tokens / self.draft_tokens)
+        })
+    }
+
+    /// Mean accepted length per speculative step: `1 + accepted / steps`.
+    pub fn draft_mean(&self) -> Option<f64> {
+        self.last_draft_mean.or_else(|| {
+            (self.draft_steps > 0.0).then(|| 1.0 + self.accepted_tokens / self.draft_steps)
+        })
+    }
+
     pub fn observe(&mut self, line: &str) {
         if line.contains("listening on http") || line.contains("model loaded") {
             self.alive = true;
+        }
+        // Per-request speculative summary (INFO level):
+        //   draft acceptance = 0.62000 (  310 accepted /   500 generated), mean len =  2.40
+        //   acc per pos = (0.800, 0.600, 0.400)
+        if line.contains("draft acceptance =") {
+            if let Some(rest) = line.split("draft acceptance =").nth(1) {
+                let ratio = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|x| x.parse::<f64>().ok());
+                if let Some(r) = ratio {
+                    self.last_draft_accept = Some(r);
+                }
+                if let Some(m) = rest
+                    .split("mean len =")
+                    .nth(1)
+                    .and_then(|x| x.split_whitespace().next())
+                    .and_then(|x| x.parse::<f64>().ok())
+                {
+                    self.last_draft_mean = Some(m);
+                }
+            }
+        }
+        if line.contains("acc per pos = (") {
+            if let Some(inner) = line
+                .split("acc per pos = (")
+                .nth(1)
+                .and_then(|s| s.split(')').next())
+            {
+                self.last_draft_per_pos = inner
+                    .split(',')
+                    .filter_map(|x| x.trim().parse::<f64>().ok())
+                    .collect();
+            }
         }
         if !line.contains("tokens per second") {
             return;
@@ -73,6 +133,10 @@ pub struct MetricSample {
     pub prompt: f64,
     pub prompt_secs: f64,
     pub requests: f64,
+    /// Speculative decoding counters (0 when spec-decode is off).
+    pub draft: f64,
+    pub accepted: f64,
+    pub drafts: f64,
 }
 
 fn metric_value(line: &str) -> Option<(&str, f64)> {
@@ -102,6 +166,12 @@ pub fn parse_metrics(text: &str) -> Option<MetricSample> {
             s.prompt_secs = v;
         } else if n.ends_with("requests_total") || n.ends_with("requests_processed_total") {
             s.requests = v;
+        } else if n.ends_with("spec_decode_num_draft_tokens_total") {
+            s.draft = v;
+        } else if n.ends_with("spec_decode_num_accepted_tokens_total") {
+            s.accepted = v;
+        } else if n.ends_with("spec_decode_num_drafts_total") {
+            s.drafts = v;
         }
     }
     seen.then_some(s)
@@ -164,6 +234,10 @@ impl MetricsPoller {
                 self.stats.reqs = cur.requests as u64;
             }
         }
+        // Speculative counters are cumulative; no diff needed.
+        self.stats.draft_tokens = cur.draft;
+        self.stats.accepted_tokens = cur.accepted;
+        self.stats.draft_steps = cur.drafts;
         if cur.predicted_secs > 0.0 {
             self.stats.dec_tokens = cur.predicted;
             self.stats.dec_secs = cur.predicted_secs;
@@ -236,5 +310,35 @@ mod tests {
         assert!(p.observe(text));
         assert_eq!(p.stats.last_dec, Some(51.7));
         assert!(p.stats.last_pre.unwrap() > 90.0);
+    }
+
+    #[test]
+    fn draft_acceptance_is_read_from_the_log() {
+        let mut s = Stats::default();
+        s.observe("0.10.000.000 I srv  slot release: draft acceptance = 0.62000 (  310 accepted /   500 generated), mean len =  2.40");
+        s.observe("0.10.000.001 I srv  slot release:      acc per pos = (0.800, 0.600, 0.400)");
+        assert_eq!(s.draft_accept(), Some(0.62));
+        assert_eq!(s.draft_mean(), Some(2.40));
+        assert_eq!(s.last_draft_per_pos, vec![0.8, 0.6, 0.4]);
+    }
+
+    #[test]
+    fn speculative_metrics_are_cumulative() {
+        let text = "\
+llamacpp:tokens_predicted_total 100
+llamacpp:tokens_predicted_seconds_total 10
+llamacpp:spec_decode_num_draft_tokens_total 500
+llamacpp:spec_decode_num_accepted_tokens_total 310
+llamacpp:spec_decode_num_drafts_total 200
+";
+        let s = parse_metrics(text).expect("metrics");
+        assert_eq!(s.draft, 500.0);
+        assert_eq!(s.accepted, 310.0);
+        assert_eq!(s.drafts, 200.0);
+
+        let mut p = MetricsPoller::new(131072);
+        assert!(p.observe(text));
+        assert!((p.stats.draft_accept().unwrap() - 0.62).abs() < 1e-9);
+        assert!((p.stats.draft_mean().unwrap() - 2.55).abs() < 1e-9);
     }
 }

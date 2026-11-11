@@ -169,6 +169,15 @@ impl KnobValue for u16 {
     }
 }
 
+impl KnobValue for i32 {
+    fn to_text(&self) -> String {
+        self.to_string()
+    }
+    fn from_text(s: &str) -> Result<Self, String> {
+        s.parse().map_err(|_| format!("expected a whole number, got '{s}'"))
+    }
+}
+
 impl KnobValue for f64 {
     fn to_text(&self) -> String {
         // Match the argv spelling: 1.0 prints as "1", 0.95 as "0.95".
@@ -314,20 +323,111 @@ profile_knobs! {
         , Applies::All
         , "--cache-type-v"
         , "Precision of the V half; unset means 'same as K'.";
+    draft_ctk : String
+        , "KV draft/MTP K"
+        , Group::Context
+        , Kind::Enum(KV_ENUM)
+        , Applies::Draft
+        , "--cache-type-k-draft"
+        , "Precision of the draft/MTP context K; empty keeps llama.cpp's f16.";
+    draft_ctv : String
+        , "KV draft/MTP V"
+        , Group::Context
+        , Kind::Enum(KV_ENUM)
+        , Applies::Draft
+        , "--cache-type-v-draft"
+        , "Precision of the draft/MTP context V; empty keeps llama.cpp's f16.";
     ngl : u16
         , "GPU layers"
         , Group::Memory
         , Kind::Num { min: 0, max: 999, unit: "" }
         , Applies::All
         , "-ngl"
-        , "Layers offloaded to the GPU; 99/999 mean all of them.";
+        , "Whole transformer blocks offloaded to the GPU; 99/999 mean all of them. This does not decide where MoE experts live - use --n-cpu-moe for that.";
     ncmoe : u16
         , "experts on CPU"
         , Group::Memory
         , Kind::Num { min: 0, max: 999, unit: "" }
         , Applies::Moe
         , "--n-cpu-moe"
-        , "MoE only: expert layers kept in RAM to save VRAM.";
+        , "MoE only: keep the routed expert tensors of the first N blocks in host RAM, even when those blocks are offloaded. With mmap they are read from disk on demand; --load-mode none keeps them in RAM.";
+    load_mode : String
+        , "load mode"
+        , Group::Memory
+        , Kind::Enum(&["auto", "mmap", "none", "mlock", "mmap+mlock", "dio"])
+        , Applies::All
+        , "--load-mode"
+        , "How weights are read: mmap pages them from disk on demand; none loads them into anonymous RAM (no SSD paging); mlock pins them; dio uses direct I/O.";
+    moe_cache_mib : u32
+        , "MoE cache MiB"
+        , Group::Memory
+        , Kind::Num { min: 0, max: 65536, unit: "MiB" }
+        , Applies::Moe
+        , "--moe-cache-mib"
+        , "GPU cache for experts that stay on the CPU; hot experts stop being re-read from SSD. 0 disables it, 2048 is a useful start.";
+    cpu_moe : bool
+        , "all experts CPU"
+        , Group::Memory
+        , Kind::Bool
+        , Applies::Moe
+        , "--cpu-moe"
+        , "Keep every routed expert in host RAM. The rest of each block can still be on the GPU.";
+    n_cpu_ffn : u16
+        , "dense FFN on CPU"
+        , Group::Memory
+        , Kind::Num { min: 0, max: 999, unit: "" }
+        , Applies::All
+        , "--n-cpu-ffn"
+        , "Keep the dense feed-forward weights of the first N blocks in host RAM (dense models; MoE experts use n-cpu-moe).";
+    override_tensor : String
+        , "tensor overrides"
+        , Group::Memory
+        , Kind::Text
+        , Applies::All
+        , "--override-tensor"
+        , "Fine placement, e.g. blk\\.1[0-9]\\.ffn_up=CPU or \\.ffn_exps\\.=CUDA0. Comma-separate several rules.";
+    lazy_mode : String
+        , "lazy tensors"
+        , Group::Memory
+        , Kind::Enum(&["on", "auto", "off"])
+        , Applies::All
+        , "--lazy-mode"
+        , "Read large per-layer tensors from disk on demand (needs mmap); off keeps them resident.";
+    numa : String
+        , "NUMA"
+        , Group::Memory
+        , Kind::Enum(&["distribute", "isolate", "numactl"])
+        , Applies::All
+        , "--numa"
+        , "NUMA strategy on multi-socket hosts; leave unset on a single socket.";
+    no_op_offload : bool
+        , "output on CPU"
+        , Group::Memory
+        , Kind::Bool
+        , Applies::All
+        , "--no-op-offload"
+        , "Keep the output layer in host RAM instead of VRAM; frees a little card memory.";
+    kv_ram : bool
+        , "KV in RAM"
+        , Group::Memory
+        , Kind::Bool
+        , Applies::All
+        , "--no-kv-offload"
+        , "Keep the KV cache in host RAM instead of VRAM. Frees the card, costs decode speed.";
+    split_mode : String
+        , "multi-GPU split"
+        , Group::Memory
+        , Kind::Enum(&["layer", "row", "tensor", "none"])
+        , Applies::All
+        , "--split-mode"
+        , "How two cards share the model: layer is the safe default, row suits MoE.";
+    tensor_split : String
+        , "tensor split"
+        , Group::Memory
+        , Kind::Text
+        , Applies::All
+        , "--tensor-split"
+        , "Per-card share, e.g. 0.57,0.43. Empty means an even split.";
     port : u16
         , "port"
         , Group::Server
@@ -342,6 +442,62 @@ profile_knobs! {
         , Applies::All
         , "--threads"
         , "CPU threads; physical cores usually beat SMT siblings.";
+    threads_batch : u32
+        , "batch threads"
+        , Group::Speed
+        , Kind::Num { min: 1, max: 256, unit: "" }
+        , Applies::All
+        , "--threads-batch"
+        , "Threads used for prompt processing; empty reuses --threads.";
+    batch_size : u32
+        , "batch size"
+        , Group::Speed
+        , Kind::Num { min: 1, max: 65536, unit: "" }
+        , Applies::All
+        , "--batch-size"
+        , "Logical batch for prompt processing; larger batches use more compute buffers.";
+    ubatch_size : u32
+        , "micro-batch"
+        , Group::Speed
+        , Kind::Num { min: 1, max: 65536, unit: "" }
+        , Applies::All
+        , "--ubatch-size"
+        , "Physical micro-batch; must divide batch-size. 512 is a safe default.";
+    parallel : u32
+        , "parallel slots"
+        , Group::Speed
+        , Kind::Num { min: 1, max: 64, unit: "" }
+        , Applies::All
+        , "--parallel"
+        , "Concurrent request slots; each slot gets its own KV cache, so memory grows with it.";
+    prio : i32
+        , "thread priority"
+        , Group::Speed
+        , Kind::Num { min: -1, max: 3, unit: "" }
+        , Applies::All
+        , "--prio"
+        , "Process priority: low -1, normal 0, medium 1, high 2, realtime 3.";
+    cache_reuse : u32
+        , "cache reuse"
+        , Group::Speed
+        , Kind::Num { min: 0, max: 65536, unit: "tok" }
+        , Applies::All
+        , "--cache-reuse"
+        , "Reuse a matching KV prefix in chunks of this size; 0 disables reuse. 256 skips re-prefill of repeated prompts.";
+    draft_n_min : u16
+        , "draft min tokens"
+        , Group::Speed
+        , Kind::Num { min: 0, max: 16, unit: "" }
+        , Applies::Draft
+        , "--spec-draft-n-min"
+        , "Minimum tokens proposed per speculative step; unset uses the engine default.";
+    draft_p_min : f64
+        , "draft min prob"
+        , Group::Speed
+        , Kind::Float { min: 0.0, max: 1.0 }
+        , Applies::Draft
+        , "--spec-draft-p-min"
+        , "Stop drafting when the draft probability drops below this; unset uses the engine default.";
     reasoning : String
         , "reasoning"
         , Group::Sampling
@@ -426,6 +582,48 @@ profile_knobs! {
         , Applies::All
         , "--top-p"
         , "Nucleus sampling cutoff; 0.95 is the common default.";
+    top_k : u32
+        , "top-k"
+        , Group::Sampling
+        , Kind::Num { min: 0, max: 100000, unit: "" }
+        , Applies::All
+        , "--top-k"
+        , "Keep only the K most likely tokens; 0 disables the cutoff. 20 suits thinking models, 64 is a general default.";
+    min_p : f64
+        , "min-p"
+        , Group::Sampling
+        , Kind::Float { min: 0.0, max: 1.0 }
+        , Applies::All
+        , "--min-p"
+        , "Drop tokens below this fraction of the top token's probability; 0 disables it.";
+    repeat_penalty : f64
+        , "repeat penalty"
+        , Group::Sampling
+        , Kind::Float { min: 0.0, max: 10.0 }
+        , Applies::All
+        , "--repeat-penalty"
+        , "Penalty for tokens already in the context; 1.0 means no penalty.";
+    presence_penalty : f64
+        , "presence penalty"
+        , Group::Sampling
+        , Kind::Float { min: -2.0, max: 2.0 }
+        , Applies::All
+        , "--presence-penalty"
+        , "Flat penalty for any token that already appeared; 0 disables it.";
+    frequency_penalty : f64
+        , "frequency penalty"
+        , Group::Sampling
+        , Kind::Float { min: -2.0, max: 2.0 }
+        , Applies::All
+        , "--frequency-penalty"
+        , "Penalty proportional to how often a token appeared; 0 disables it.";
+    seed : i32
+        , "seed"
+        , Group::Sampling
+        , Kind::Num { min: -1, max: 2_147_483_647, unit: "" }
+        , Applies::All
+        , "--seed"
+        , "Sampling seed; -1 draws a random one at startup.";
     host : String
         , "host"
         , Group::Server
@@ -433,6 +631,34 @@ profile_knobs! {
         , Applies::All
         , "--host"
         , "Bind address; 127.0.0.1 keeps the server local.";
+    api_key : String
+        , "API key"
+        , Group::Server
+        , Kind::Text
+        , Applies::All
+        , "--api-key"
+        , "Require this key in the Authorization header; empty leaves the server open.";
+    timeout : u32
+        , "request timeout"
+        , Group::Server
+        , Kind::Num { min: 0, max: 86400, unit: "s" }
+        , Applies::All
+        , "--timeout"
+        , "Stop a request after this many seconds; 0 means no limit.";
+    threads_http : u32
+        , "HTTP threads"
+        , Group::Server
+        , Kind::Num { min: 1, max: 256, unit: "" }
+        , Applies::All
+        , "--threads-http"
+        , "Worker threads for HTTP handling; unset uses the engine default.";
+    log_verbosity : u32
+        , "log verbosity"
+        , Group::Advanced
+        , Kind::Num { min: 0, max: 4, unit: "" }
+        , Applies::All
+        , "--log-verbosity"
+        , "4 prints the memory breakdown the placement card reads; 3 is quieter.";
 }
 
 /// Look up a knob by its key.

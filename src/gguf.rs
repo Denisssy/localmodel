@@ -103,6 +103,17 @@ pub struct Meta {
     pub nextn_layers: u32,
     /// Per-block KV shape, used by `fit::for_gguf`.
     pub kv: KvGeometry,
+    /// Bytes of the tensors that belong to each block (`blk.N.*`). Empty when
+    /// the tensor table could not be read. Used to say which layers sit in
+    /// VRAM and which stay in host RAM.
+    pub block_bytes: Vec<u64>,
+    /// The part of `block_bytes` that is routed experts (`*_exps`). This is
+    /// what `--n-cpu-moe` moves to RAM.
+    pub block_expert_bytes: Vec<u64>,
+    /// `token_embd.weight`: llama.cpp normally keeps it in host memory.
+    pub input_bytes: u64,
+    /// Output tensor and final norms: offloaded together with the last layer.
+    pub output_bytes: u64,
 }
 
 #[derive(Default)]
@@ -136,6 +147,10 @@ pub fn parse(path: &Path) -> Meta {
         ctx_train: 0,
         nextn_layers: 0,
         kv: KvGeometry::default(),
+        block_bytes: Vec::new(),
+        block_expert_bytes: Vec::new(),
+        input_bytes: 0,
+        output_bytes: 0,
     };
     let data = match read_prefix(path) {
         Some(d) => d,
@@ -173,6 +188,8 @@ pub fn parse(path: &Path) -> Meta {
     let mut max_layer = 0u32;
     // Dominant tensor type weighted by element count (the bulk of the weights).
     let mut counts: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    let mut blocks: Vec<u64> = Vec::new();
+    let mut experts: Vec<u64> = Vec::new();
     for _ in 0..tensor_count {
         let name = match c.string() {
             Some(n) => n,
@@ -205,6 +222,29 @@ pub fn parse(path: &Path) -> Meta {
         }
         let e = counts.entry(t).or_insert(0);
         *e = e.saturating_add(numel);
+        // Tensor bytes at this quantization. The tensor table is a better
+        // source than the file size: it is exact and already split per block,
+        // which is what the placement card needs.
+        let bytes = (numel as f64 * type_bytes_per_element(t)).round() as u64;
+        match parse_blk_index(name) {
+            Some(l) => {
+                let i = l as usize;
+                if blocks.len() <= i {
+                    blocks.resize(i + 1, 0);
+                    experts.resize(i + 1, 0);
+                }
+                blocks[i] = blocks[i].saturating_add(bytes);
+                if name.windows(5).any(|w| w == b"_exps") {
+                    experts[i] = experts[i].saturating_add(bytes);
+                }
+            }
+            None if name.starts_with(b"token_embd") => {
+                meta.input_bytes = meta.input_bytes.saturating_add(bytes);
+            }
+            None => {
+                meta.output_bytes = meta.output_bytes.saturating_add(bytes);
+            }
+        }
         // Unsloth UD quants ship the MTP head inside the main file.
         if name.windows(7).any(|w| w == b".nextn.") {
             meta.nextn = true;
@@ -224,6 +264,11 @@ pub fn parse(path: &Path) -> Meta {
     meta.ctx_train = raw.ctx_train.unwrap_or(0);
     meta.nextn_layers = raw.nextn_layers.unwrap_or(if meta.nextn { 1 } else { 0 });
     meta.kv = build_kv(&raw, meta.block_count, meta.nextn_layers);
+    let n = meta.block_count as usize;
+    blocks.resize(n, 0);
+    experts.resize(n, 0);
+    meta.block_bytes = blocks;
+    meta.block_expert_bytes = experts;
     meta
 }
 
@@ -424,6 +469,51 @@ pub fn chat_template(path: &Path) -> Option<String> {
     found
 }
 
+/// Bytes per element for a ggml tensor type. Block formats are quoted as
+/// bytes-per-32 (or per-256) in `ggml-common.h`; this keeps the placement
+/// estimate independent of the file size.
+fn type_bytes_per_element(t: u32) -> f64 {
+    match t {
+        0 => 4.0,                 // F32
+        1 => 2.0,                 // F16
+        2 => 0.5625,              // Q4_0
+        3 => 0.625,               // Q4_1
+        6 => 0.6875,              // Q5_0
+        7 => 0.75,                // Q5_1
+        8 => 1.0625,              // Q8_0
+        9 => 1.125,               // Q8_1
+        10 => 0.328_125,          // Q2_K
+        11 => 0.429_687_5,        // Q3_K
+        12 => 0.5625,             // Q4_K
+        13 => 0.6875,             // Q5_K
+        14 => 0.820_312_5,        // Q6_K
+        15 => 1.140_625,          // Q8_K
+        16 => 0.257_812_5,        // IQ2_XXS
+        17 => 0.289_062_5,        // IQ2_XS
+        18 => 0.382_812_5,        // IQ3_XXS
+        19 => 0.195_312_5,        // IQ1_S
+        20 => 0.5625,             // IQ4_NL
+        21 => 0.429_687_5,        // IQ3_S
+        22 => 0.320_312_5,        // IQ2_S
+        23 => 0.531_25,           // IQ4_XS
+        24 => 1.0,                // I8
+        25 => 2.0,                // I16
+        26 => 4.0,                // I32
+        27 => 8.0,                // I64
+        28 => 8.0,                // F64
+        29 => 0.218_75,           // IQ1_M
+        30 => 2.0,                // BF16
+        34 => 54.0 / 256.0,       // TQ1_0  (2 + 4 + 48 bytes per 256)
+        35 => 66.0 / 256.0,       // TQ2_0  (2 + 64 bytes per 256)
+        39 => 17.0 / 32.0,        // MXFP4  (1 + 16 bytes per 32)
+        40 => 36.0 / 64.0,        // NVFP4  (4 + 32 bytes per 64)
+        41 => 18.0 / 128.0,       // Q1_0   (2 + 16 bytes per 128)
+        42 => 18.0 / 64.0,        // Q2_0   (2 + 16 bytes per 64)
+        43 => 1.0,                // F8_E4M3
+        _ => 2.0,                 // be conservative for unknown types
+    }
+}
+
 fn ggml_type_name(t: u32) -> &'static str {
     match t {
         0 => "F32",
@@ -455,6 +545,13 @@ fn ggml_type_name(t: u32) -> &'static str {
         28 => "F64",
         29 => "IQ1_M",
         30 => "BF16",
+        34 => "TQ1_0",
+        35 => "TQ2_0",
+        39 => "MXFP4",
+        40 => "NVFP4",
+        41 => "Q1_0",
+        42 => "Q2_0",
+        43 => "F8_E4M3",
         _ => "unknown",
     }
 }

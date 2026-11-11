@@ -1,16 +1,21 @@
 mod config;
+mod dev;
 mod download;
+
+use crate::dev::Dev;
 mod engine;
 mod fit;
 mod gguf;
 mod hub;
 mod jinja;
 mod knobs;
+mod mem;
 mod models;
 mod resolve;
 mod server;
 mod settings;
 mod stats;
+mod telemetry;
 mod validate;
 
 use std::fs::File;
@@ -42,8 +47,36 @@ struct RunOpts {
     port: Option<u16>,
     ngl: Option<u16>,
     ncmoe: Option<u16>,
+    load_mode: Option<String>,
+    moe_cache_mib: Option<u32>,
+    cpu_moe: Option<bool>,
+    n_cpu_ffn: Option<u16>,
+    override_tensor: Option<String>,
+    lazy_mode: Option<String>,
+    numa: Option<String>,
+    no_op_offload: Option<bool>,
+    batch_size: Option<u32>,
+    ubatch_size: Option<u32>,
+    parallel: Option<u32>,
+    threads_batch: Option<u32>,
+    prio: Option<i32>,
+    cache_reuse: Option<u32>,
+    draft_n_min: Option<u16>,
+    draft_p_min: Option<f64>,
+    top_k: Option<u32>,
+    min_p: Option<f64>,
+    repeat_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    seed: Option<i32>,
+    api_key: Option<String>,
+    timeout: Option<u32>,
+    threads_http: Option<u32>,
     ctk: Option<String>,
     ctv: Option<String>,
+    /// draft/MTP context K/V cache type; empty keeps the f16 engine default
+    draft_ctk: Option<String>,
+    draft_ctv: Option<String>,
     reasoning: Option<String>,
     effort: Option<String>,
     draft_tokens: Option<u16>,
@@ -55,6 +88,14 @@ struct RunOpts {
     profile: Option<String>,
     /// keep the MTP draft on the GPU (small ctx only)
     draft_gpu: Option<bool>,
+    /// keep the KV cache in host RAM instead of VRAM
+    kv_ram: Option<bool>,
+    /// layer | row | tensor | none
+    split_mode: Option<String>,
+    /// per-card shares, e.g. "0.57,0.43"
+    tensor_split: Option<String>,
+    /// llama.cpp log level; 4 prints the memory breakdown
+    log_verbosity: Option<u32>,
     /// enable multimodal vision input ("on" | "off")
     vision: Option<String>,
     /// path to multimodal projector file (--mmproj)
@@ -73,6 +114,11 @@ struct RunOpts {
     size: Option<String>,
     access: Option<String>,
     tune: Option<String>,
+    /// Transient settings for `localmodel dev`: a full profile layered over
+    /// `[defaults]`, applied in memory and never written back. Lets the
+    /// playground override the on-disk model profile without touching
+    /// settings.toml.
+    dev_scratch: Option<knobs::Profile>,
 }
 
 impl Default for RunOpts {
@@ -83,8 +129,35 @@ impl Default for RunOpts {
             port: None,
             ngl: None,
             ncmoe: None,
+            load_mode: None,
+            moe_cache_mib: None,
+            cpu_moe: None,
+            n_cpu_ffn: None,
+            override_tensor: None,
+            lazy_mode: None,
+            numa: None,
+            no_op_offload: None,
+            batch_size: None,
+            ubatch_size: None,
+            parallel: None,
+            threads_batch: None,
+            prio: None,
+            cache_reuse: None,
+            draft_n_min: None,
+            draft_p_min: None,
+            top_k: None,
+            min_p: None,
+            repeat_penalty: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            api_key: None,
+            timeout: None,
+            threads_http: None,
             ctk: None,
             ctv: None,
+            draft_ctk: None,
+            draft_ctv: None,
             reasoning: None,
             effort: None,
             draft_tokens: None,
@@ -93,6 +166,10 @@ impl Default for RunOpts {
             tools: None,
             profile: None,
             draft_gpu: None,
+            kv_ram: None,
+            split_mode: None,
+            tensor_split: None,
+            log_verbosity: None,
             alias: None,
             repl: false,
             dry_run: false,
@@ -106,19 +183,40 @@ impl Default for RunOpts {
             mmproj: None,
             access: None,
             tune: None,
+            dev_scratch: None,
         }
     }
 }
 
 /// Fully resolved launch configuration: CLI flags > model profile > defaults.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 struct Cfg {
     ctx: u32,
     port: Option<u16>,
     ngl: Option<u16>,
     ncmoe: Option<u16>,
+    load_mode: Option<String>,
+    moe_cache_mib: Option<u32>,
+    cpu_moe: bool,
+    n_cpu_ffn: Option<u16>,
+    override_tensor: Option<String>,
+    lazy_mode: Option<String>,
+    numa: Option<String>,
+    no_op_offload: bool,
+    batch_size: Option<u32>,
+    ubatch_size: Option<u32>,
+    parallel: Option<u32>,
+    threads_batch: Option<u32>,
+    prio: Option<i32>,
+    cache_reuse: Option<u32>,
+    draft_n_min: Option<u16>,
+    draft_p_min: Option<f64>,
     ctk: String,
     ctv: String,
+    /// Draft/MTP context K cache type; empty means the f16 engine default.
+    draft_ctk: String,
+    /// Draft/MTP context V cache type; empty means the f16 engine default.
+    draft_ctv: String,
     threads: Option<u32>,
     reasoning: Option<String>,
     effort: Option<String>,
@@ -128,6 +226,11 @@ struct Cfg {
     tools: Option<String>,
     /// keep the MTP draft on the GPU (small ctx only)
     draft_gpu: bool,
+    /// keep the KV cache in host RAM (`--no-kv-offload`)
+    kv_ram: bool,
+    split_mode: String,
+    tensor_split: Option<String>,
+    log_verbosity: u32,
     /// multimodal vision input enabled
     vision: bool,
     /// path to multimodal projector file (--mmproj)
@@ -136,7 +239,16 @@ struct Cfg {
     flash_attn: bool,
     temp: f64,
     top_p: f64,
+    top_k: Option<u32>,
+    min_p: Option<f64>,
+    repeat_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    seed: Option<i32>,
     host: String,
+    api_key: Option<String>,
+    timeout: Option<u32>,
+    threads_http: Option<u32>,
 }
 
 impl Cfg {
@@ -185,6 +297,7 @@ fn main() {
             None => cmd_run(&args[1..]),
         },
         Some("hub") => hub::cmd_hub(&args[1..]),
+        Some("dev") => Dev::cmd_dev(&args[1..]),
         Some("strata") => cmd_strata(&args[1..]),
         Some("doctor") | Some("fit") => cmd_doctor(&args[1..]),
         Some("info") | Some("show") => cmd_info(&args[1..]),
@@ -217,6 +330,7 @@ fn help() {
 USAGE:
   localmodel                      pick a model from the list and launch it
   localmodel hub                  models + their launch settings on one screen
+  localmodel dev                  playground: tweak every setting, launch, reset on stop
   localmodel run <model> [opts]   launch a model by name substring or index
   localmodel run <family>/<size>  same hub, Strata engine (e.g. qwen36/ud-q4_k_xl)
   localmodel strata <family> <size>  launch a Strata catalog model
@@ -242,6 +356,8 @@ RUN OPTIONS:
   --kv T         KV cache type for K and V   (default q8_0)
   --ctk T        KV cache type for K         (default q8_0)
   --ctv T        KV cache type for V         (default q8_0)
+--draft-ctk T  draft/MTP context K for models with a draft head (default f16)
+--draft-ctv T  draft/MTP context V for models with a draft head (default f16)
   --ncmoe N      experts kept on CPU   (big MoE models only, default 58)
   --ngl N        layers on GPU         (default 99 for dense, 999 for MoE)
   --engine E     auto | strata | llama
@@ -256,6 +372,11 @@ RUN OPTIONS:
   --tools L      built-in agent tools: all | off | read_file,exec_shell
   --profile NAME use a named settings profile instead of the model's own
   --draft-gpu    external draft on GPU (built-in MTP ignores this)
+  --kv-ram       keep the KV cache in host RAM (frees VRAM, costs speed)
+  --kv-vram      keep the KV cache in VRAM (default)
+  --split-mode M two-card split: layer | row | tensor | none (default layer)
+  --tensor-split S  per-card share, e.g. 0.57,0.43 (default even)
+  --log-verbosity N llama.cpp log level 0..4 (default 4: memory breakdown)
   --threads N    CPU threads
   --alias NAME   served model name
   --extra \"...\"  extra engine flags (after saved ones, so they win)
@@ -494,6 +615,11 @@ fn cmd_info(args: &[String]) -> i32 {
     let mut ctk: Option<String> = None;
     let mut ctv: Option<String> = None;
     let mut port: Option<u16> = None;
+    let mut kv_ram: Option<bool> = None;
+    let mut split_mode: Option<String> = None;
+    let mut tensor_split: Option<String> = None;
+    let mut draft_ctk: Option<String> = None;
+    let mut draft_ctv: Option<String> = None;
     let mut query: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -511,6 +637,12 @@ fn cmd_info(args: &[String]) -> i32 {
                     ctv = Some(v);
                 }
             }
+            "--kv-ram" => kv_ram = Some(true),
+            "--kv-vram" => kv_ram = Some(false),
+            "--split-mode" => split_mode = val(&mut i),
+            "--tensor-split" => tensor_split = val(&mut i),
+            "--draft-ctk" => draft_ctk = Some(val(&mut i).unwrap_or_default()),
+            "--draft-ctv" => draft_ctv = Some(val(&mut i).unwrap_or_default()),
             s if s.starts_with('-') => {}
             s => query.push(s.to_string()),
         }
@@ -533,24 +665,39 @@ fn cmd_info(args: &[String]) -> i32 {
             Some(m) => m,
             None => return 1,
         };
-        let alias = models::stem(&model.name);
+        let stem = models::stem(&model.name);
+        let draft = if model.nextn {
+            None
+        } else {
+            models::find_draft(&model.path)
+        };
         let saved = settings::load();
-        let prof = saved.for_model(&alias);
-        let ctx = ctx.or(prof.ctx).unwrap_or(131072);
-        let ctk = ctk.or(prof.ctk).unwrap_or_else(|| "q8_0".into());
-        let ctv = ctv.or(prof.ctv).unwrap_or_else(|| ctk.clone());
-        let port = port.or(prof.port).unwrap_or(8080);
+        let model_profile = saved.model.get(&stem);
+        let mut o = RunOpts::default();
+        o.query = query.clone();
+        o.ctx = ctx;
+        o.ctk = ctk;
+        o.ctv = ctv;
+        o.port = port;
+        o.kv_ram = kv_ram;
+        o.split_mode = split_mode;
+        o.tensor_split = tensor_split;
+        o.draft_ctk = draft_ctk;
+        o.draft_ctv = draft_ctv;
+        let (cfg, _) = Cfg::explain(&o, &saved.defaults, model_profile);
+        let alias = cfg.alias.clone().unwrap_or_else(|| stem.clone());
+        let port = cfg.port.unwrap_or(8080);
         let logpath = dir.join(format!(".localmodel-{port}.log"));
         let launch = format!("localmodel run {alias}");
         if std::io::stdout().is_terminal() {
             println!(
                 "{}",
-                render_info(&model, &alias, port, ctx, &ctk, &ctv, &logpath, "llama.cpp", &launch)
+                render_info(&model, &alias, port, &cfg, &logpath, "llama.cpp", &launch, draft.as_deref())
             );
         } else {
             println!(
                 "{}",
-                model_card(&model, &alias, port, ctx, &ctk, &ctv, &logpath, "llama.cpp")
+                model_card(&model, &alias, port, &cfg, &logpath, "llama.cpp", draft.as_deref())
             );
         }
         return 0;
@@ -590,12 +737,12 @@ fn cmd_info(args: &[String]) -> i32 {
         if std::io::stdout().is_terminal() {
             println!(
                 "{}",
-                render_info(&model, &info.served, port, ctx, &ctk, &ctv, &logpath, &engine, &launch)
+                render_info(&model, &info.served, port, &card_cfg(ctx, &ctk, &ctv, "", ""), &logpath, &engine, &launch, None)
             );
         } else {
             println!(
                 "{}",
-                model_card(&model, &info.served, port, ctx, &ctk, &ctv, &logpath, &engine)
+                model_card(&model, &info.served, port, &card_cfg(ctx, &ctk, &ctv, "", ""), &logpath, &engine, None)
             );
         }
         return 0;
@@ -804,13 +951,39 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     // reads `knob.argv` to spot shadowing `extra`) and the hub's argv panel
     // agree with what is actually launched.
     let f = |key: &str| knobs::knob(key).map(|k| k.argv).unwrap_or("");
+    let extra_flags = c.extra.as_deref().unwrap_or("");
+    let shadowed_flag = |flag: &str| {
+        extra_flags
+            .split_whitespace()
+            .any(|p| p == flag || p.starts_with(&format!("{flag}=")))
+    };
     push(&mut a, "-m", &m.path.display().to_string());
     push(&mut a, f("alias"), alias);
     push(&mut a, f("ctx"), &c.ctx.to_string());
-    push(&mut a, "--parallel", "1");
     push(&mut a, f("flash_attn"), if c.flash_attn { "on" } else { "off" });
     push(&mut a, f("ctk"), &c.ctk);
     push(&mut a, f("ctv"), &c.ctv);
+    // Draft/MTP cache types. Emitted only when the user set a type and no
+    // `extra` flag already names the same option (checked by both the long and
+    // short spelling, so `-ctkd q4_0` in extra is not duplicated); `fit::
+    // draft_kv_types` resolves the effective type for the card display.
+    let extra = c.extra.as_deref().unwrap_or("");
+    let shadowed = |key: &str| -> bool {
+        let aliases = match key {
+            "draft_ctk" => ["--cache-type-k-draft", "-ctkd"],
+            "draft_ctv" => ["--cache-type-v-draft", "-ctvd"],
+            _ => return false,
+        };
+        extra.split_whitespace().any(|p| {
+            aliases.iter().any(|al| *al == p || p.starts_with(&format!("{al}=")))
+        })
+    };
+    if !c.draft_ctk.is_empty() && !shadowed("draft_ctk") {
+        push(&mut a, f("draft_ctk"), &c.draft_ctk);
+    }
+    if !c.draft_ctv.is_empty() && !shadowed("draft_ctv") {
+        push(&mut a, f("draft_ctv"), &c.draft_ctv);
+    }
     push(&mut a, f("temp"), &c.temp.to_string());
     push(&mut a, f("top_p"), &c.top_p.to_string());
     push(&mut a, f("host"), &c.host);
@@ -832,8 +1005,69 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     a.push("--metrics".to_string());
     // Reuse the KV cache across requests in >=256-token chunks: repeated
     // system prompts / long chat prefixes skip re-prefill instead of being
-    // recomputed. 0 (the default) disables reuse entirely.
-    push(&mut a, "--cache-reuse", "256");
+    // recomputed. 0 disables reuse entirely.
+    if !shadowed_flag("--cache-reuse") {
+        push(
+            &mut a,
+            f("cache_reuse"),
+            &c.cache_reuse.unwrap_or(256).to_string(),
+        );
+    }
+    // Batch sizes and request parallelism were hardcoded per model before;
+    // they are real knobs now so a slow or memory-tight machine can tune them
+    // without dropping into `extra`.
+    if !shadowed_flag("-b") && !shadowed_flag("--batch-size") {
+        push(&mut a, f("batch_size"), &c.batch_size.unwrap_or(2048).to_string());
+    }
+    if !shadowed_flag("-ub") && !shadowed_flag("--ubatch-size") {
+        push(&mut a, f("ubatch_size"), &c.ubatch_size.unwrap_or(512).to_string());
+    }
+    if !shadowed_flag("--parallel") {
+        push(&mut a, f("parallel"), &c.parallel.unwrap_or(1).to_string());
+    }
+
+    // Where the KV cache and the cards' share live. `kv_ram` is a valueless
+    // flag (`--no-kv-offload`), so it is emitted only when on; the other two
+    // only when they differ from llama.cpp's own defaults. That keeps the
+    // common single-card argv unchanged.
+    if c.kv_ram {
+        a.push(f("kv_ram").to_string());
+    }
+    if c.split_mode != "layer" {
+        push(&mut a, f("split_mode"), &c.split_mode);
+    }
+    if let Some(ts) = &c.tensor_split {
+        push(&mut a, f("tensor_split"), ts);
+    }
+    // Level 4 is what prints llama.cpp's per-device memory breakdown; the
+    // placement card parses that instead of guessing.
+    push(&mut a, f("log_verbosity"), &c.log_verbosity.to_string());
+
+    // Memory placement knobs that used to require hand-written `extra`.
+    if let Some(v) = &c.load_mode {
+        push(&mut a, f("load_mode"), v);
+    }
+    if let Some(v) = c.moe_cache_mib {
+        push(&mut a, f("moe_cache_mib"), &v.to_string());
+    }
+    if c.cpu_moe {
+        a.push(f("cpu_moe").to_string());
+    }
+    if let Some(v) = c.n_cpu_ffn {
+        push(&mut a, f("n_cpu_ffn"), &v.to_string());
+    }
+    if let Some(v) = &c.override_tensor {
+        push(&mut a, f("override_tensor"), v);
+    }
+    if let Some(v) = &c.lazy_mode {
+        push(&mut a, f("lazy_mode"), v);
+    }
+    if let Some(v) = &c.numa {
+        push(&mut a, f("numa"), v);
+    }
+    if c.no_op_offload {
+        a.push(f("no_op_offload").to_string());
+    }
 
     // Effort/thinking control, driven by what the template actually reads
     // (Qwen3.8: reasoning_effort; Nemotron: medium_effort). Explicit setting
@@ -853,17 +1087,13 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     if n.contains("nemotron") {
         push(&mut a, f("ngl"), &c.ngl.unwrap_or(999).to_string());
         push(&mut a, f("ncmoe"), &c.ncmoe.unwrap_or(58).to_string());
-        let extra = c.extra.as_deref().unwrap_or("");
-        let has_flag = |f: &str| {
-            extra
-                .split_whitespace()
-                .any(|p| p == f || p.starts_with(&format!("{f}=")))
-        };
-        if !has_flag("-b") && !has_flag("--batch-size") {
-            push(&mut a, "--batch-size", "2048");
+        if let Some(k) = c.top_k {
+            if !shadowed_flag("--top-k") {
+                push(&mut a, f("top_k"), &k.to_string());
+            }
         }
-        if !has_flag("-ub") && !has_flag("--ubatch-size") {
-            push(&mut a, "--ubatch-size", "512");
+        if let Some(p) = c.min_p {
+            push(&mut a, f("min_p"), &p.to_string());
         }
         if let Some(d) = draft {
             push(&mut a, "--spec-type", "draft-dflash");
@@ -874,19 +1104,13 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     } else if m.moe {
         push(&mut a, f("ngl"), &c.ngl.unwrap_or(99).to_string());
         push(&mut a, f("ncmoe"), &c.ncmoe.unwrap_or(58).to_string());
-        // As in the dense branch: `extra` may override the batch sizes, so
-        // only emit the defaults when the profile did not.
-        let extra = c.extra.as_deref().unwrap_or("");
-        let has_flag = |f: &str| {
-            extra
-                .split_whitespace()
-                .any(|p| p == f || p.starts_with(&format!("{f}=")))
-        };
-        if !has_flag("-b") && !has_flag("--batch-size") {
-            push(&mut a, "--batch-size", "2048");
+        if let Some(k) = c.top_k {
+            if !shadowed_flag("--top-k") {
+                push(&mut a, f("top_k"), &k.to_string());
+            }
         }
-        if !has_flag("-ub") && !has_flag("--ubatch-size") {
-            push(&mut a, "--ubatch-size", "512");
+        if let Some(p) = c.min_p {
+            push(&mut a, f("min_p"), &p.to_string());
         }
         if m.nextn {
             // Built-in MTP head (blk.N.nextn.*): llama.cpp drafts from the
@@ -902,31 +1126,18 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
         }
     } else {
         push(&mut a, f("ngl"), &c.ngl.unwrap_or(99).to_string());
-        // Default batch sizes; a profile's `extra` may override them, so do
-        // not emit a duplicate that only makes the dry-run command confusing.
-        let extra = c.extra.as_deref().unwrap_or("");
-        let has_flag = |f: &str| {
-            extra
-                .split_whitespace()
-                .any(|p| p == f || p.starts_with(&format!("{f}=")))
-        };
-        if !has_flag("-b") && !has_flag("--batch-size") {
-            push(&mut a, "--batch-size", "2048");
-        }
-        if !has_flag("-ub") && !has_flag("--ubatch-size") {
-            push(&mut a, "--ubatch-size", "512");
-        }
-        // As with the batch sizes: a profile's `extra` may set --top-k (e.g.
-        // the model card's recommended sampling), so only default otherwise.
-        if !has_flag("--top-k") {
-            if n.contains("qwen") || n.contains("ornith") {
+        // A profile's `extra` may set --top-k (e.g. the model card's
+        // recommended sampling), so only default otherwise.
+        if !shadowed_flag("--top-k") {
+            let k = c.top_k.unwrap_or(if n.contains("qwen") || n.contains("ornith") {
                 // Unsloth/Qwen best practice: top_k 20 for thinking models.
-                push(&mut a, "--top-k", "20");
+                20
             } else {
-                push(&mut a, "--top-k", "64");
-            }
+                64
+            });
+            push(&mut a, f("top_k"), &k.to_string());
         }
-        push(&mut a, "--min-p", "0");
+        push(&mut a, f("min_p"), &c.min_p.unwrap_or(0.0).to_string());
         if m.nextn {
             // Unsloth UD quants already contain the MTP head (blk.N.nextn.*).
             // llama.cpp builds the draft context from the target model itself,
@@ -967,6 +1178,39 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     }
     if let Some(t) = c.threads {
         push(&mut a, f("threads"), &t.to_string());
+    }
+    if let Some(t) = c.threads_batch {
+        push(&mut a, f("threads_batch"), &t.to_string());
+    }
+    if let Some(p) = c.prio {
+        push(&mut a, f("prio"), &p.to_string());
+    }
+    if let Some(v) = c.draft_n_min {
+        push(&mut a, f("draft_n_min"), &v.to_string());
+    }
+    if let Some(v) = c.draft_p_min {
+        push(&mut a, f("draft_p_min"), &v.to_string());
+    }
+    if let Some(v) = c.repeat_penalty {
+        push(&mut a, f("repeat_penalty"), &v.to_string());
+    }
+    if let Some(v) = c.presence_penalty {
+        push(&mut a, f("presence_penalty"), &v.to_string());
+    }
+    if let Some(v) = c.frequency_penalty {
+        push(&mut a, f("frequency_penalty"), &v.to_string());
+    }
+    if let Some(v) = c.seed {
+        push(&mut a, f("seed"), &v.to_string());
+    }
+    if let Some(v) = &c.api_key {
+        push(&mut a, f("api_key"), v);
+    }
+    if let Some(v) = c.timeout {
+        push(&mut a, f("timeout"), &v.to_string());
+    }
+    if let Some(v) = c.threads_http {
+        push(&mut a, f("threads_http"), &v.to_string());
     }
     if let Some(t) = &c.tools {
         // llama.cpp built-in agent tools (file/shell access). Off by default:
@@ -1104,11 +1348,10 @@ fn run_strata(
             &display_model,
             &served,
             port,
-            ctx,
-            spec.effective_kv(),
-            spec.effective_kv(),
+            &card_cfg(ctx, spec.effective_kv(), spec.effective_kv(), "", ""),
             &logpath,
             "strata",
+            None,
         )
     );
     println!();
@@ -1177,34 +1420,61 @@ fn strata_dashboard(
     let _ = out.flush();
 
     let mut show_logs = true;
+    let mut paused = false;
+    let mut redraw = true;
     let mut frame = 0usize;
     let mut misses = 0u32;
+    let hw = fit::Hardware::probe(&config::models_dir());
+    let cfg = card_cfg(info.ctx, &info.ctk, &info.ctv, "", "");
 
     loop {
-        let alive = match curl_get(&format!("{url}/metrics")) {
-            Some(t) => poller.observe(&t),
-            None => false,
-        };
-        misses = if alive { 0 } else { misses + 1 };
+        // While paused, stop repainting so the terminal selection survives and
+        // the card can be copied. One repaint is still done when the state
+        // changes (p / o / l), so the PAUSED banner appears immediately.
+        if !paused || redraw {
+            let alive = match curl_get(&format!("{url}/metrics")) {
+                Some(t) => poller.observe(&t),
+                None => false,
+            };
+            misses = if alive { 0 } else { misses + 1 };
 
-        let snapshot = poller.stats.clone();
-        let gpu = server::gpu_info();
-        let ram = ram_text(0);
-        let (cols, rows) = screen_size();
-        let screen = render_screen(
-            model, info, &snapshot, gpu.as_ref(), &ram, logpath, show_logs, frame, None, cols,
-            rows,
-        );
-        print!("\x1b[H{}\x1b[J", screen.replace('\n', "\r\n"));
-        let _ = out.flush();
+            let snapshot = poller.stats.clone();
+            let gpus = server::gpu_infos();
+            let ram = ram_text(0);
+            let (cols, rows) = screen_size();
+            let plan = mem::plan(model, None, &cfg, &hw);
+            let screen = render_screen(
+                model,
+                info,
+                &snapshot,
+                model.nextn,
+                &gpus,
+                &ram,
+                logpath,
+                show_logs,
+                frame,
+                None,
+                paused,
+                cols,
+                rows,
+                &cfg,
+                &hw,
+                &plan,
+                None,
+            );
+            print!("{}", paint_screen(&screen, cols));
+            let _ = out.flush();
+            redraw = false;
 
-        // 30 seconds without /metrics: the server is gone.
-        if misses > 30 {
-            break;
+            // 30 seconds without /metrics: the server is gone.
+            if misses > 30 {
+                break;
+            }
         }
 
         let mut quit = false;
-        if event::poll(Duration::from_millis(500)).unwrap_or(false) {
+        let timeout = if paused { Duration::from_millis(250) } else { Duration::from_millis(500) };
+        if event::poll(timeout).unwrap_or(false) {
             loop {
                 if let Ok(Event::Key(k)) = event::read() {
                     if k.modifiers.contains(KeyModifiers::CONTROL)
@@ -1214,7 +1484,18 @@ fn strata_dashboard(
                     } else {
                         match k.code {
                             KeyCode::Char('q') | KeyCode::Esc => quit = true,
-                            KeyCode::Char('l') => show_logs = !show_logs,
+                            KeyCode::Char('l') => {
+                                show_logs = !show_logs;
+                                redraw = true;
+                            }
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
+                                paused = true;
+                                redraw = true;
+                            }
+                            KeyCode::Char('o') | KeyCode::Char('O') => {
+                                paused = false;
+                                redraw = true;
+                            }
                             _ => {}
                         }
                     }
@@ -1227,7 +1508,9 @@ fn strata_dashboard(
         if quit {
             break;
         }
-        frame += 1;
+        if !paused {
+            frame += 1;
+        }
     }
 
     let _ = execute!(out, LeaveAlternateScreen, Show);
@@ -1718,75 +2001,289 @@ fn ram_text(pid: u32) -> RamText {
 }
 
 /// Static model card shown once when the server starts.
+/// A Cfg with the built-in defaults, for the static cards (`info` and the
+/// line-mode startup card) where no saved profile is resolved.
+fn card_cfg(ctx: u32, ctk: &str, ctv: &str, draft_ctk: &str, draft_ctv: &str) -> Cfg {
+    Cfg {
+        ctx,
+        port: None,
+        ngl: None,
+        ncmoe: None,
+        ctk: ctk.to_string(),
+        ctv: ctv.to_string(),
+        draft_ctk: draft_ctk.to_string(),
+        draft_ctv: draft_ctv.to_string(),
+        threads: None,
+        reasoning: None,
+        effort: None,
+        draft_tokens: None,
+        extra: None,
+        tools: None,
+        draft_gpu: false,
+        kv_ram: false,
+        split_mode: "layer".into(),
+        tensor_split: None,
+        log_verbosity: 4,
+        vision: false,
+        mmproj: None,
+        alias: None,
+        flash_attn: true,
+        temp: 1.0,
+        top_p: 0.95,
+        host: "127.0.0.1".into(),
+        ..Cfg::default()
+    }
+}
+
+/// MEMORY + PLACEMENT blocks, shared by every card (startup, `info`, the
+/// dashboard and the hub's estimate area). `live` is llama.cpp's own log
+/// breakdown once the model has loaded.
+fn memory_lines(
+    plan: &mem::Plan,
+    live: Option<&telemetry::LoadInfo>,
+    hw: &fit::Hardware,
+    compact: bool,
+) -> Vec<String> {
+    let mut b = vec![section("MEMORY")];
+    if compact {
+        b.push(kv(
+            "VRAM",
+            &format!(
+                "{} {:.2} / {:.2} GiB",
+                vram_bar(plan.vram_gb(), hw.vram_room_gb().max(0.01), 16),
+                plan.vram_gb(),
+                hw.vram_room_gb()
+            ),
+        ));
+        let rows = match live {
+            Some(l) => l.rows(),
+            None => plan.place_rows(),
+        };
+        for (name, val) in rows {
+            b.push(kv(&name, &val));
+        }
+        if live.map(|l| l.mmap_cpu_experts).unwrap_or(false) {
+            b.push(kv("mmap", &format!("{YELLOW}CPU experts read from SSD{RESET}")));
+        }
+        return b;
+    }
+    b.push(kv(
+        "Weights",
+        &format!(
+            "{:.2} GiB  {DIM}incl. output tensor {:.2}{RESET}",
+            plan.total_weights_gb, plan.output_gb
+        ),
+    ));
+    b.push(kv(
+        "KV main",
+        &format!("{:.2} GiB  {DIM}{}{RESET}", plan.kv_main_gb, plan.kv_home.label()),
+    ));
+    if plan.kv_draft_gb > 0.01 {
+        b.push(kv(
+            "KV draft/MTP",
+            &format!("{:.2} GiB  {DIM}{}{RESET}", plan.kv_draft_gb, plan.draft_types),
+        ));
+    }
+    b.push(kv("Compute", &format!("{:.2} GiB {DIM}buffers + CUDA{RESET}", plan.overhead_gb)));
+    let room = hw.vram_room_gb();
+    b.push(kv(
+        "VRAM",
+        &format!(
+            "{} {:.2} / {:.2} GiB {DIM}usable{RESET}",
+            vram_bar(plan.vram_gb(), room.max(0.01), 20),
+            plan.vram_gb(),
+            room
+        ),
+    ));
+    b.push(kv(
+        "Offload",
+        &format!(
+            "{}/{} layers  {DIM}split {}{RESET}",
+            plan.ngl, plan.block_count, plan.split_mode
+        ),
+    ));
+    if plan.ncmoe > 0 {
+        b.push(kv(
+            "Experts in RAM",
+            &format!("first {} blocks  {DIM}--n-cpu-moe{RESET}", plan.ncmoe),
+        ));
+    }
+    if plan.host.total_gb() > 0.01 {
+        b.push(kv(
+            "Host RAM",
+            &format!(
+                "{:.2} GiB  {DIM}input emb. {:.2}{RESET}",
+                plan.host.total_gb(),
+                plan.input_gb
+            ),
+        ));
+    }
+    b.push(kv(
+        "Placement",
+        &format!(
+            "{DIM}{}{RESET}",
+            if live.is_some() {
+                "actual · llama.cpp startup log"
+            } else if plan.approx {
+                "planned · block sizes approximated"
+            } else {
+                "planned · from GGUF tensor table"
+            }
+        ),
+    ));
+    if let Some(l) = live {
+        for (name, val) in l.rows() {
+            b.push(kv(&name, &val));
+        }
+        if let Some((a, t)) = l.offloaded {
+            b.push(kv("Offloaded", &format!("{a}/{t} layers to GPU")));
+        }
+        if l.mmap_cpu_experts {
+            b.push(kv(
+                "Warning",
+                &format!("{YELLOW}CPU experts are mmap'd: every token re-reads them from SSD{RESET}"),
+            ));
+            b.push(kv(
+                "Fix",
+                &format!("{YELLOW}--load-mode none (RAM) or --moe-cache-mib N (GPU cache){RESET}"),
+            ));
+        }
+    } else {
+        for (name, val) in plan.place_rows() {
+            b.push(kv(&name, &val));
+        }
+    }
+    if let Some(note) = &plan.note {
+        b.push(kv("", &format!("{YELLOW}{note}{RESET}")));
+    }
+    b
+}
+
+fn gpu_lines() -> Vec<String> {
+    let gpus = server::gpu_infos();
+    let mut b = vec![section("GPU")];
+    if gpus.is_empty() {
+        b.push(kv("Device", &format!("{DIM}n/a{RESET}")));
+        return b;
+    }
+    for g in &gpus {
+        let pct = if g.mem_total > 0.0 { g.mem_used / g.mem_total * 100.0 } else { 0.0 };
+        b.push(kv(
+            &format!("GPU{}", g.index),
+            &format!("{}  {DIM}{:.0}% util · {:.0}°C · {:.0}/{:.0} W{RESET}", g.name, g.util, g.temp, g.power_draw, g.power_limit),
+        ));
+        b.push(kv(
+            "",
+            &format!(
+                "{} {:.1}/{:.1} GiB {DIM}({:.1}%){RESET}",
+                vram_bar(g.mem_used, g.mem_total, 20),
+                g.mem_used / 1024.0,
+                g.mem_total / 1024.0,
+                pct
+            ),
+        ));
+    }
+    if gpus.len() > 1 {
+        let link = match server::has_nvlink() {
+            Some(true) => format!("{GREEN}NVLink{RESET}"),
+            Some(false) => format!("{YELLOW}PCIe, no NVLink{RESET}"),
+            None => format!("{DIM}unknown{RESET}"),
+        };
+        b.push(kv("Interconnect", &link));
+    }
+    b.push(kv("Backend", "CUDA (cuBLAS)"));
+    b
+}
+
+/// Plan for a static card: the built-in MTP head is already in `m`, an
+/// external draft file is parsed here so its weights and KV land in the right
+/// column.
+fn card_plan(
+    m: &Model,
+    cfg: &Cfg,
+    hw: &fit::Hardware,
+    draft: Option<&Path>,
+) -> mem::Plan {
+    if m.nextn {
+        return mem::plan(m, None, cfg, hw);
+    }
+    let parsed = draft.and_then(|p| {
+        let meta = gguf::parse(p);
+        let bytes = std::fs::metadata(p).ok()?.len();
+        Some((meta, bytes))
+    });
+    let d = parsed
+        .as_ref()
+        .map(|(meta, bytes)| mem::Draft { meta, weights: *bytes });
+    mem::plan(m, d, cfg, hw)
+}
+
+/// Static colored card for the startup line and `localmodel info`.
+/// Extra MEMORY rows for placement knobs that are set. Kept separate from
+/// `memory_lines` because that function works from the plan, while these are
+/// engine switches that change *how* the plan is realised on disk/RAM.
+fn placement_knob_lines(cfg: &Cfg) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(mode) = &cfg.load_mode {
+        let note = match mode.as_str() {
+            "none" => "anonymous RAM, no SSD paging",
+            "mmap" | "mmap+mlock" => "experts read from SSD on demand",
+            "mlock" => "pinned in RAM, never swapped",
+            "dio" => "direct I/O, bypasses page cache",
+            _ => "engine chooses per device",
+        };
+        v.push(kv("Load mode", &format!("{mode}  {DIM}{note}{RESET}")));
+    }
+    if let Some(n) = cfg.moe_cache_mib {
+        v.push(kv("MoE cache", &format!("{n} MiB on GPU  {DIM}hot experts stay on the card{RESET}")));
+    }
+    if cfg.cpu_moe {
+        v.push(kv("CPU MoE", &format!("all experts  {DIM}--cpu-moe{RESET}")));
+    }
+    if let Some(n) = cfg.n_cpu_ffn {
+        v.push(kv("CPU FFN", &format!("first {n} blocks  {DIM}--n-cpu-ffn{RESET}")));
+    }
+    if let Some(ot) = &cfg.override_tensor {
+        v.push(kv("Overrides", &format!("{DIM}{ot}{RESET}")));
+    }
+    v
+}
+
 fn model_card(
     m: &Model,
     alias: &str,
     port: u16,
-    ctx: u32,
-    ctk: &str,
-    ctv: &str,
+    cfg: &Cfg,
     logpath: &Path,
     engine: &str,
+    draft: Option<&Path>,
 ) -> String {
+    let hw = fit::Hardware::probe(&config::models_dir());
+    let plan = card_plan(m, cfg, &hw, draft);
     let kind = if m.moe { "MoE" } else { "Dense" };
-    let mut body: Vec<String> = Vec::new();
-    body.push(String::new());
-    body.push("  [Model]".to_string());
-    body.push(format!("  Engine:    {engine}"));
-    body.push(format!("  Type:      {kind}"));
-    body.push(format!("  Size:      {} (quantized: {})", models::human(m.size), m.quant));
-    body.push(format!("  Context:   {} tokens ({}K)", ctx, ctx / 1024));
-    body.push(format!("  Layers:    {}", m.layers));
-    body.push(format!("  KV cache:  {ctk}/{ctv}"));
+    let mut body: Vec<String> = vec![String::new(), section("MODEL")];
+    body.push(kv("Engine", engine));
+    body.push(kv("Architecture", &format!("{kind} · {}", if m.meta.arch.is_empty() { m.name.as_str() } else { m.meta.arch.as_str() })));
+    body.push(kv("Size", &format!("{}  {DIM}quant{RESET} {MAGENTA}{}{RESET}", models::human(m.size), m.quant)));
+    body.push(kv("Context", &format!("{}  {DIM}({}K){RESET}", cfg.ctx, cfg.ctx / 1024)));
+    body.push(kv("Layers", &m.layers.to_string()));
+    body.push(kv("KV cache", &format!("{}/{}{}", cfg.ctk, cfg.ctv, if cfg.kv_ram { " · RAM" } else { " · VRAM" })));
     if m.moe && m.experts_total > 0 {
-        body.push(format!(
-            "  Experts:   {} total, {} active per token",
-            m.experts_total, m.experts_active
-        ));
+        body.push(kv("Experts", &format!("{} total, {} active/token", m.experts_total, m.experts_active)));
     }
-
-    if let Some(g) = server::gpu_info() {
-        let pct = if g.mem_total > 0.0 { g.mem_used / g.mem_total * 100.0 } else { 0.0 };
-        body.push(String::new());
-        body.push("  [GPU]".to_string());
-        body.push(format!("  Device:    {}", g.name));
-        body.push(format!("  SM util:   {:.0}%", g.util));
-        body.push(format!(
-            "  VRAM:      {:.1}/{:.1} GB ({pct:.1}%)",
-            g.mem_used / 1024.0,
-            g.mem_total / 1024.0
-        ));
-        body.push(format!("  Temp:      {:.0}°C", g.temp));
-        body.push(format!("  Power:     {:.0}W / {:.0}W", g.power_draw, g.power_limit));
-        body.push("  Backend:   CUDA (cuBLAS)".to_string());
-    }
-
     body.push(String::new());
-    body.push("  [Server]".to_string());
-    body.push(format!("  URL:       http://127.0.0.1:{port}/v1"));
-    body.push(format!("  Log:       {}", logpath.display()));
-
-    let w = body.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-    let title = format!("Model: {alias}");
-    let between = w + 2;
-    let used = 3 + title.chars().count() + 1; // "┌─ " + title + " "
-    let remain = between.saturating_sub(used);
-    let mut out = String::from("┌─ ");
-    out.push_str(&title);
-    out.push(' ');
-    out.push_str(&"─".repeat(remain));
-    out.push_str("┐\n");
-    for l in &body {
-        let pad = w - l.chars().count();
-        out.push_str("│ ");
-        out.push_str(l);
-        out.push_str(&" ".repeat(pad + 1));
-        out.push_str("│\n");
-    }
-    out.push('└');
-    out.push_str(&"─".repeat(between));
-    out.push('┘');
-    out
+    body.extend(memory_lines(&plan, None, &hw, false));
+    body.extend(placement_knob_lines(cfg));
+    body.push(String::new());
+    body.extend(gpu_lines());
+    body.push(String::new());
+    body.push(section("SERVER"));
+    body.push(kv("URL", &format!("http://127.0.0.1:{port}/v1")));
+    body.push(kv("Log", &logpath.display().to_string()));
+    body.push(String::new());
+    let title = format!("{CYAN}{BOLD}{alias}{RESET} {DIM}:{port}{RESET}");
+    let footer = format!("{DIM}localmodel hub  ·  settings  ·  params{RESET}");
+    boxed(&title, &body, &footer, screen_size().0.max(80))
 }
 
 const RESET: &str = "\x1b[0m";
@@ -1853,9 +2350,28 @@ fn clip_visible(s: &str, max: usize) -> String {
     out
 }
 
+/// Wrap a rendered screen for the terminal.
+///
+/// `\x1b[2K` before every line erases the whole line, so a shorter line never
+/// leaves the tail of the previous frame on screen. The old renderer only
+/// emitted `\x1b[J` once at the end, which cleared below the cursor but not
+/// the right-hand side of earlier lines - that is where the stray characters
+/// came from. Lines are clipped to `cols - 1` so a full-width line cannot
+/// trigger the terminal's auto-wrap and shift every following row.
+pub(crate) fn paint_screen(screen: &str, cols: usize) -> String {
+    let mut out = String::with_capacity(screen.len() + 32);
+    out.push_str("\x1b[H");
+    for line in screen.lines() {
+        out.push_str("\x1b[2K");
+        out.push_str(&clip_visible(line, cols.saturating_sub(1)));
+        out.push_str("\r\n");
+    }
+    out.push_str("\x1b[J");
+    out
+}
+
 /// Terminal size, or a sane fallback when stdout is not a terminal.
-fn screen_size() -> (usize, usize) {
-    terminal::size()
+fn screen_size() -> (usize, usize) {    terminal::size()
         .map(|(c, r)| (c as usize, r as usize))
         .unwrap_or((100, 40))
 }
@@ -1880,14 +2396,20 @@ fn render_screen(
     m: &Model,
     info: &Info,
     s: &Stats,
-    gpu: Option<&server::GpuInfo>,
+    has_draft: bool,
+    gpus: &[server::GpuInfo],
     ram: &RamText,
     logpath: &Path,
     show_logs: bool,
     frame: usize,
     hint: Option<&str>,
+    paused: bool,
     cols: usize,
     rows: usize,
+    cfg: &Cfg,
+    hw: &fit::Hardware,
+    plan: &mem::Plan,
+    live: Option<&telemetry::LoadInfo>,
 ) -> String {
     let (dot, state) = if s.alive { (GREEN, "UP") } else { (YELLOW, "loading") };
     let spin = if s.alive { " ".to_string() } else { SPINNER[frame % SPINNER.len()].to_string() };
@@ -1904,20 +2426,21 @@ fn render_screen(
     );
     let ctx_row = kv("Context", &format!("{ctx}  {DIM}({}K){RESET}", ctx / 1024));
     let layers = kv("Layers", &m.layers.to_string());
-    let kv_row = kv("KV cache", &format!("{}/{}", info.ctk, info.ctv));
-    let experts = (m.moe && m.experts_total > 0).then(|| {
-        kv(
-            "Experts",
-            &format!("{} total, {} active/token", m.experts_total, m.experts_active),
-        )
-    });
+    let kv_row = kv(
+        "KV cache",
+        &format!(
+            "{}/{}  {DIM}in {}{RESET}",
+            info.ctk,
+            info.ctv,
+            if cfg.kv_ram { "RAM" } else { "VRAM" }
+        ),
+    );
 
     let model_full = {
-        let mut g = vec![section("MODEL"), arch.clone(), size.clone(), ctx_row.clone(), layers];
-        if let Some(e) = &experts {
-            g.push(e.clone());
+        let mut g = vec![section("MODEL"), arch.clone(), size.clone(), ctx_row.clone(), layers, kv_row.clone()];
+        if m.moe && m.experts_total > 0 {
+            g.push(kv("Experts", &format!("{} total, {} active/token", m.experts_total, m.experts_active)));
         }
-        g.push(kv_row.clone());
         g.push(String::new());
         g
     };
@@ -1930,42 +2453,47 @@ fn render_screen(
         String::new(),
     ];
 
+    let memory_full = {
+        let mut g = memory_lines(plan, live, hw, false);
+        g.push(String::new());
+        g
+    };
+    // Compact: totals plus the per-device placement, so the answer to
+    // "where did the layers go" is still on screen.
+    let mut memory_short = memory_lines(plan, live, hw, true);
+    memory_short.push(String::new());
+
     let mut gpu_full = vec![section("GPU")];
     let mut gpu_short = vec![section("GPU")];
-    if let Some(g) = gpu {
-        let pct = if g.mem_total > 0.0 { g.mem_used / g.mem_total * 100.0 } else { 0.0 };
-        let device = kv("Device", &g.name);
-        let vram = kv(
-            "VRAM",
-            &format!(
-                "{} {:.1}/{:.1} GB  {} {:.1}%",
+    if gpus.is_empty() {
+        gpu_full.push(kv("Device", &format!("{DIM}n/a{RESET}")));
+        gpu_short.push(kv("Device", &format!("{DIM}n/a{RESET}")));
+    } else {
+        for g in gpus {
+            let pct = if g.mem_total > 0.0 { g.mem_used / g.mem_total * 100.0 } else { 0.0 };
+            gpu_full.push(kv(
+                &format!("GPU{}", g.index),
+                &format!("{}  {DIM}{:.0}% util · {:.0}°C · {:.0}/{:.0} W{RESET}", g.name, g.util, g.temp, g.power_draw, g.power_limit),
+            ));
+            let bar = format!(
+                "{} {:.1}/{:.1} GiB {DIM}({:.1}%){RESET}",
                 vram_bar(g.mem_used, g.mem_total, 24),
                 g.mem_used / 1024.0,
                 g.mem_total / 1024.0,
-                if pct >= 95.0 { RED } else if pct >= 80.0 { YELLOW } else { GREEN },
                 pct
-            ),
-        );
-        gpu_full.push(device.clone());
-        gpu_full.push(vram.clone());
-        gpu_full.push(kv(
-            "Load",
-            &format!(
-                "util {}{:.0}%{}   {DIM}temp{RESET} {:.0}°C   {DIM}power{RESET} {:.0}/{:.0} W",
-                if g.util >= 90.0 { GREEN } else { RESET },
-                g.util,
-                RESET,
-                g.temp,
-                g.power_draw,
-                g.power_limit
-            ),
-        ));
+            );
+            gpu_full.push(kv("", &bar));
+            gpu_short.push(kv(&format!("GPU{}", g.index), &bar));
+        }
+        if gpus.len() > 1 {
+            let link = match server::has_nvlink() {
+                Some(true) => format!("{GREEN}NVLink{RESET}"),
+                Some(false) => format!("{YELLOW}PCIe, no NVLink{RESET}"),
+                None => format!("{DIM}unknown{RESET}"),
+            };
+            gpu_full.push(kv("Interconnect", &link));
+        }
         gpu_full.push(kv("Backend", "CUDA (cuBLAS)"));
-        gpu_short.push(device);
-        gpu_short.push(vram);
-    } else {
-        gpu_full.push(kv("Device", &format!("{DIM}n/a{RESET}")));
-        gpu_short.push(kv("Device", &format!("{DIM}n/a{RESET}")));
     }
     gpu_full.push(String::new());
     gpu_short.push(String::new());
@@ -1981,22 +2509,47 @@ fn render_screen(
     );
     let ram_row = kv("RAM", &ram.system);
     let srv_ram = kv("Server RAM", &ram.server);
-    let live_full = vec![
-        section("LIVE"),
-        speed.clone(),
-        kv("Time/token", &tpt),
+    let draft_row = if let Some(acc) = s.draft_accept() {
+        let mut txt = format!("{GREEN}{:.0}%{RESET}", acc * 100.0);
+        if let Some(mean) = s.draft_mean() {
+            txt.push_str(&format!("  {DIM}mean {mean:.2} tok/step{RESET}"));
+        }
+        if !s.last_draft_per_pos.is_empty() {
+            let pos = s
+                .last_draft_per_pos
+                .iter()
+                .map(|x| format!("{:.0}", x * 100.0))
+                .collect::<Vec<_>>()
+                .join("/");
+            txt.push_str(&format!("  {DIM}pos {pos}%{RESET}"));
+        }
+        Some(kv("Draft accept", &txt))
+    } else if has_draft {
+        // The model has a draft/MTP head, but nothing has been generated yet:
+        // keep the row visible so the number is easy to find once a request
+        // completes.
+        Some(kv(
+            "Draft accept",
+            &format!("{DIM}--  waiting for the first request{RESET}"),
+        ))
+    } else {
+        None
+    };
+    let mut live_full = vec![section("LIVE"), speed.clone(), kv("Time/token", &tpt)];
+    if let Some(row) = &draft_row {
+        live_full.push(row.clone());
+    }
+    live_full.extend([
         kv("Requests", &s.reqs.to_string()),
         ram_row.clone(),
         srv_ram.clone(),
         String::new(),
-    ];
-    let live_short = vec![
-        section("LIVE"),
-        speed.clone(),
-        ram_row.clone(),
-        srv_ram.clone(),
-        String::new(),
-    ];
+    ]);
+    let mut live_short = vec![section("LIVE"), speed.clone()];
+    if let Some(row) = &draft_row {
+        live_short.push(row.clone());
+    }
+    live_short.extend([ram_row.clone(), srv_ram.clone(), String::new()]);
 
     let server_group = vec![
         section("SERVER"),
@@ -2013,7 +2566,9 @@ fn render_screen(
             log_group.push(format!("  {DIM}waiting for output...{RESET}"));
         } else {
             for l in &logs {
-                log_group.push(log_line(l));
+                // Use the full card width: the box is capped at `cols - 5`, so
+                // this keeps two spaces of prefix inside it.
+                log_group.push(log_line_w(l, cols.saturating_sub(7).max(20)));
             }
         }
         log_group.push(String::new());
@@ -2022,8 +2577,15 @@ fn render_screen(
     // Progressive fit: full card, then compact sections, then fewer sections.
     // Never let the terminal scroll or cut a row in half.
     let budget = rows.saturating_sub(4); // two borders + two footer lines
-    let full = vec![model_full, gpu_full, live_full, server_group.clone()];
-    let compact = vec![model_short, gpu_short, live_short.clone(), server_group.clone()];
+    let full = vec![model_full, memory_full, gpu_full, live_full, server_group.clone()];
+    let compact = vec![
+        model_short,
+        memory_short.clone(),
+        gpu_short,
+        live_short.clone(),
+        server_group.clone(),
+    ];
+    let minimal = vec![memory_short, live_short.clone(), server_group.clone()];
     let with_log = |g: &Vec<Vec<String>>| {
         let mut g = g.clone();
         if show_logs {
@@ -2036,6 +2598,7 @@ fn render_screen(
         with_log(&compact),
         full,
         compact,
+        minimal,
         vec![live_short, server_group.clone()],
         vec![server_group],
     ];
@@ -2063,8 +2626,13 @@ fn render_screen(
     }
 
     let title = format!("{dot}●{RESET} {} :{}", info.alias, info.port);
+    let paused_row = if paused {
+        format!("\n  {YELLOW}PAUSED - the screen is frozen, select and copy freely; o resumes{RESET}")
+    } else {
+        String::new()
+    };
     let footer = format!(
-        "{DIM}? help · s where settings moved · l log · r restart · q quit{RESET}\n  {DIM}API http://127.0.0.1:{}/v1  ·  log {}{RESET}",
+        "{DIM}? help · s settings · l log · r restart · p pause · o resume · q quit{RESET}\n  {DIM}API http://127.0.0.1:{}/v1  ·  log {}{RESET}{paused_row}",
         info.port,
         logpath.display()
     );
@@ -2074,7 +2642,11 @@ fn render_screen(
 /// Shared frame renderer: title bar + rows + footer. `cols` is the terminal
 /// width, so the box never wraps (which is what leaves smears behind).
 fn boxed(title: &str, body: &[String], footer: &str, cols: usize) -> String {
-    let cap = cols.saturating_sub(2).max(20);
+    // The outer frame is `w + 4` columns ("│ " + w + " │"). Leave five cells
+    // for it plus one spare: a line that fills the terminal exactly makes the
+    // terminal auto-wrap, which shifts every following row. Capping at
+    // `cols - 2` used to make the card wider than the terminal.
+    let cap = cols.saturating_sub(5).max(12);
     let mut w = body
         .iter()
         .map(|l| vlen(l))
@@ -2084,7 +2656,7 @@ fn boxed(title: &str, body: &[String], footer: &str, cols: usize) -> String {
         .max(40)
         .min(cap);
     if vlen(title) > w.saturating_sub(2) {
-        w = w.max(20);
+        w = w.max(20).min(cap);
         let t = clip_visible(title, w.saturating_sub(2));
         return boxed_body(&t, body, footer, w, cols);
     }
@@ -2093,13 +2665,14 @@ fn boxed(title: &str, body: &[String], footer: &str, cols: usize) -> String {
 
 fn boxed_body(title: &str, body: &[String], footer: &str, w: usize, cols: usize) -> String {
     let tvis = vlen(title);
-    let between = w + 2;
-    let used = 3 + tvis + 1;
-    let remain = between.saturating_sub(used);
+    // Every row is exactly this wide: "│ " + w + " │" = w + 4.
+    let outer = w + 4;
+    // "┌─ " + title + " " + dashes + "┐" must add up to `outer` too.
+    let dashes = outer.saturating_sub(3 + tvis + 1 + 1);
     let mut out = String::from("┌─ ");
     out.push_str(title);
     out.push(' ');
-    out.push_str(&"─".repeat(remain));
+    out.push_str(&"─".repeat(dashes));
     out.push_str("┐\n");
     for l in body {
         let l = clip_visible(l, w);
@@ -2110,7 +2683,7 @@ fn boxed_body(title: &str, body: &[String], footer: &str, w: usize, cols: usize)
         out.push_str("│\n");
     }
     out.push('└');
-    out.push_str(&"─".repeat(between));
+    out.push_str(&"─".repeat(outer.saturating_sub(2)));
     out.push('┘');
     if !footer.is_empty() {
         out.push('\n');
@@ -2129,68 +2702,43 @@ fn render_info(
     m: &Model,
     alias: &str,
     port: u16,
-    ctx: u32,
-    ctk: &str,
-    ctv: &str,
+    cfg: &Cfg,
     logpath: &Path,
     engine: &str,
     launch: &str,
+    draft: Option<&Path>,
 ) -> String {
-    let mut body: Vec<String> = Vec::new();
-    body.push(String::new());
-    body.push(section("MODEL"));
+    let hw = fit::Hardware::probe(&config::models_dir());
+    let plan = card_plan(m, cfg, &hw, draft);
+    let mut body: Vec<String> = vec![String::new(), section("MODEL")];
     body.push(kv("Engine", engine));
     body.push(kv("Architecture", if m.moe { "MoE" } else { "Dense" }));
     body.push(kv(
         "Size",
         &format!("{}  {DIM}quant{RESET} {MAGENTA}{}{RESET}", models::human(m.size), m.quant),
     ));
-    body.push(kv("Context", &format!("{ctx}  {DIM}({}K){RESET}", ctx / 1024)));
+    body.push(kv("Context", &format!("{}  {DIM}({}K){RESET}", cfg.ctx, cfg.ctx / 1024)));
     body.push(kv("Layers", &m.layers.to_string()));
-    body.push(kv("KV cache", &format!("{ctk}/{ctv}")));
+    body.push(kv("KV cache", &format!("{}/{}{}", cfg.ctk, cfg.ctv, if cfg.kv_ram { " · RAM" } else { " · VRAM" })));
     body.push(kv("File", &m.name));
     if m.moe && m.experts_total > 0 {
-        body.push(kv(
-            "Experts",
-            &format!("{} total, {} active/token", m.experts_total, m.experts_active),
-        ));
+        body.push(kv("Experts", &format!("{} total, {} active/token", m.experts_total, m.experts_active)));
     }
-
     body.push(String::new());
-    body.push(section("GPU"));
-    if let Some(g) = server::gpu_info() {
-        let pct = if g.mem_total > 0.0 { g.mem_used / g.mem_total * 100.0 } else { 0.0 };
-        body.push(kv("Device", &g.name));
-        body.push(kv(
-            "VRAM",
-            &format!(
-                "{} {:.1}/{:.1} GB  {:.1}% {DIM}(whole GPU){RESET}",
-                vram_bar(g.mem_used, g.mem_total, 24),
-                g.mem_used / 1024.0,
-                g.mem_total / 1024.0,
-                pct
-            ),
-        ));
-        body.push(kv(
-            "Load",
-            &format!("util {:.0}%   {DIM}temp{RESET} {:.0}°C   {DIM}power{RESET} {:.0}/{:.0} W", g.util, g.temp, g.power_draw, g.power_limit),
-        ));
-        body.push(kv("Backend", "CUDA (cuBLAS)"));
-    } else {
-        body.push(kv("Device", &format!("{DIM}n/a{RESET}")));
-    }
-
+    body.extend(memory_lines(&plan, None, &hw, false));
+    body.extend(placement_knob_lines(cfg));
+    body.push(String::new());
+    body.extend(gpu_lines());
     body.push(String::new());
     body.push(section("SERVER"));
     body.push(kv("URL", &format!("http://127.0.0.1:{port}/v1")));
     body.push(kv("Log", &logpath.display().to_string()));
     body.push(String::new());
-
-    let title = format!("{CYAN}{BOLD}{alias}{RESET}");
+    let title = format!("{CYAN}{BOLD}{alias}{RESET} {DIM}:{port}{RESET}");
     let footer = format!(
-        "{DIM}launch: {launch}  ·  settings: localmodel settings  ·  flags: localmodel params{RESET}"
+        "{DIM}{launch}  ·  localmodel hub{RESET}"
     );
-    boxed(&title, &body, &footer, 100)
+    boxed(&title, &body, &footer, screen_size().0.max(80))
 }
 
 /// Dynamic live stats line, refreshed every second.
@@ -2209,6 +2757,12 @@ fn stats_line(info: &Info, s: &Stats, m: &Model) -> String {
     );
     if m.moe && m.experts_total > 0 {
         line.push_str(&format!("  experts {}/{} active", m.experts_active, m.experts_total));
+    }
+    if let Some(acc) = s.draft_accept() {
+        line.push_str(&format!("  draft {:.0}%", acc * 100.0));
+        if let Some(mean) = s.draft_mean() {
+            line.push_str(&format!(" ({mean:.2} tok/step)"));
+        }
     }
     line
 }
@@ -2238,9 +2792,26 @@ fn llama_log_level(l: &str) -> Option<&str> {
     }
 }
 
-fn log_line(l: &str) -> String {
-    let low = l.to_lowercase();
-    let color = match llama_log_level(l.trim()) {
+/// Log row clipped to `max` visible cells.
+///
+/// llama.cpp prefixes every line with a `0.15.047.740` timestamp and pads the
+/// module column. On a narrow terminal that prefix eats half the row and the
+/// message is what gets truncated, so the displayed row drops the timestamp
+/// (the log file keeps it) and collapses the padding.
+fn log_line_w(l: &str, max: usize) -> String {
+    let compact = l.split_whitespace().collect::<Vec<_>>().join(" ");
+    let (level, text) = match llama_log_level(&compact) {
+        Some(lv) => {
+            let mut it = compact.splitn(3, ' ');
+            let _ts = it.next();
+            let _lv = it.next();
+            let rest = it.next().unwrap_or("");
+            (Some(lv), format!("{lv} {rest}"))
+        }
+        None => (None, compact.clone()),
+    };
+    let low = text.to_lowercase();
+    let color = match level {
         Some("E") => RED,
         Some("W") => YELLOW,
         Some(_) => DIM,
@@ -2248,7 +2819,7 @@ fn log_line(l: &str) -> String {
         None if low.contains("warn") => YELLOW,
         None => DIM,
     };
-    format!("  {color}{}{RESET}", truncate(l.trim(), 68))
+    format!("  {color}{}{RESET}", truncate(&text, max))
 }
 
 /// Last `n` non-empty lines of a file, reading only its tail.
@@ -2420,6 +2991,32 @@ fn cmd_run(args: &[String]) -> i32 {
             "--port" | "-p" => o.port = val(&mut i).and_then(|v| v.parse().ok()),
             "--ngl" => o.ngl = val(&mut i).and_then(|v| v.parse().ok()),
             "--ncmoe" => o.ncmoe = val(&mut i).and_then(|v| v.parse().ok()),
+            "--load-mode" => o.load_mode = val(&mut i),
+            "--moe-cache-mib" => o.moe_cache_mib = val(&mut i).and_then(|v| v.parse().ok()),
+            "--cpu-moe" => o.cpu_moe = Some(true),
+            "--no-cpu-moe" => o.cpu_moe = Some(false),
+            "--n-cpu-ffn" => o.n_cpu_ffn = val(&mut i).and_then(|v| v.parse().ok()),
+            "--override-tensor" => o.override_tensor = val(&mut i),
+            "--lazy-mode" => o.lazy_mode = val(&mut i),
+            "--numa" => o.numa = val(&mut i),
+            "--no-op-offload" => o.no_op_offload = Some(true),
+            "--batch-size" | "-b" => o.batch_size = val(&mut i).and_then(|v| v.parse().ok()),
+            "--ubatch-size" | "-ub" => o.ubatch_size = val(&mut i).and_then(|v| v.parse().ok()),
+            "--parallel" => o.parallel = val(&mut i).and_then(|v| v.parse().ok()),
+            "--threads-batch" | "-tb" => o.threads_batch = val(&mut i).and_then(|v| v.parse().ok()),
+            "--prio" => o.prio = val(&mut i).and_then(|v| v.parse().ok()),
+            "--cache-reuse" => o.cache_reuse = val(&mut i).and_then(|v| v.parse().ok()),
+            "--spec-draft-n-min" => o.draft_n_min = val(&mut i).and_then(|v| v.parse().ok()),
+            "--spec-draft-p-min" => o.draft_p_min = val(&mut i).and_then(|v| v.parse().ok()),
+            "--top-k" => o.top_k = val(&mut i).and_then(|v| v.parse().ok()),
+            "--min-p" => o.min_p = val(&mut i).and_then(|v| v.parse().ok()),
+            "--repeat-penalty" => o.repeat_penalty = val(&mut i).and_then(|v| v.parse().ok()),
+            "--presence-penalty" => o.presence_penalty = val(&mut i).and_then(|v| v.parse().ok()),
+            "--frequency-penalty" => o.frequency_penalty = val(&mut i).and_then(|v| v.parse().ok()),
+            "--seed" => o.seed = val(&mut i).and_then(|v| v.parse().ok()),
+            "--api-key" => o.api_key = val(&mut i),
+            "--timeout" => o.timeout = val(&mut i).and_then(|v| v.parse().ok()),
+            "--threads-http" => o.threads_http = val(&mut i).and_then(|v| v.parse().ok()),
             "--engine" => o.engine = val(&mut i),
             "--family" => o.family = val(&mut i),
             "--size" => o.size = val(&mut i),
@@ -2443,6 +3040,8 @@ fn cmd_run(args: &[String]) -> i32 {
                     o.ctv = Some(v);
                 }
             }
+            "--draft-ctk" => o.draft_ctk = val(&mut i),
+            "--draft-ctv" => o.draft_ctv = val(&mut i),
             "--reasoning" => o.reasoning = val(&mut i),
             "--effort" => o.effort = val(&mut i),
             "--draft-tokens" | "--spec-n-max" => o.draft_tokens = val(&mut i).and_then(|v| v.parse().ok()),
@@ -2450,8 +3049,19 @@ fn cmd_run(args: &[String]) -> i32 {
             "--extra" => o.extra = val(&mut i),
             "--tools" => o.tools = val(&mut i),
             "--profile" => o.profile = val(&mut i),
+            "--dev-scratch" => {
+                if let Some(v) = val(&mut i) {
+                    let p = toml::from_str(&v).unwrap_or_default();
+                    o.dev_scratch = Some(p);
+                }
+            }
             "--draft-gpu" => o.draft_gpu = Some(true),
             "--no-draft-gpu" => o.draft_gpu = Some(false),
+            "--kv-ram" => o.kv_ram = Some(true),
+            "--kv-vram" => o.kv_ram = Some(false),
+            "--split-mode" => o.split_mode = val(&mut i),
+            "--tensor-split" => o.tensor_split = val(&mut i),
+            "--log-verbosity" | "-lv" => o.log_verbosity = val(&mut i).and_then(|v| v.parse().ok()),
             "--alias" => o.alias = val(&mut i),
             "--repl" => o.repl = true,
             "--dry-run" => o.dry_run = true,
@@ -2502,11 +3112,14 @@ fn cmd_run(args: &[String]) -> i32 {
     let stem = models::stem(&model.name);
     let saved = settings::load();
     let key = o.profile.clone().unwrap_or_else(|| stem.clone());
-    if o.profile.is_some() && !saved.model.contains_key(&key) {
+    if o.profile.is_some() && !saved.model.contains_key(&key)
+        && o.dev_scratch.is_none()
+    {
         eprintln!("warning: no settings profile '{key}', using defaults for {stem}");
     }
-    let model_profile = saved.model.get(&key);
-    let (cfg, origins) = Cfg::explain(&o, &saved.defaults, model_profile);
+    let model_profile = o.dev_scratch.clone()
+        .or_else(|| saved.model.get(&key).map(|p| p.clone()));
+    let (cfg, origins) = Cfg::explain(&o, &saved.defaults, model_profile.as_ref());
     let alias = cfg.alias.clone().unwrap_or_else(|| stem.clone());
     let port = cfg.port.unwrap_or_else(|| server::free_port(8080));
 
@@ -2625,7 +3238,7 @@ fn cmd_run(args: &[String]) -> i32 {
     // The dashboard paints the card itself; line mode prints it once.
     println!(
         "{}",
-        model_card(&model, &alias, port, cfg.ctx, &cfg.ctk, &cfg.ctv, &logpath, "llama.cpp")
+        model_card(&model, &alias, port, &cfg, &logpath, "llama.cpp", draft.as_deref())
     );
     println!();
 
@@ -2905,6 +3518,8 @@ fn render_help(info: &Info, cols: usize) -> String {
         format!("  {GREEN}?  h{RESET}      this help"),
         format!("  {GREEN}s{RESET}         where settings moved (hub)"),
         format!("  {GREEN}l{RESET}         show / hide the log panel"),
+        format!("  {GREEN}p{RESET}         pause: freeze the screen so text can be selected and copied"),
+        format!("  {GREEN}o{RESET}         resume"),
         format!("  {GREEN}r{RESET}         restart the server"),
         format!("  {GREEN}q  Esc{RESET}    stop the server and quit"),
         format!("  {GREEN}Ctrl-C{RESET}    stop the server and quit"),
@@ -2917,6 +3532,8 @@ fn render_help(info: &Info, cols: usize) -> String {
         section("NOTES"),
         format!("  {DIM}RAM  system used = total - available (page cache excluded)"),
         format!("  {DIM}     server rss includes the mmap'ed model; anon is what it holds{RESET}"),
+        format!("  {DIM}Host (mmap) = CPU weights are file-backed; experts are read from disk{RESET}"),
+        format!("  {DIM}-ngl moves whole blocks; --n-cpu-moe moves only expert tensors{RESET}"),
         String::new(),
     ];
     boxed(
@@ -2935,6 +3552,7 @@ fn handle_key(
     view: &mut View,
     show_logs: &mut bool,
     hint: &mut Option<String>,
+    paused: &mut bool,
     k: KeyEvent,
 ) -> bool {
     // Ctrl-C / Ctrl-D quit; Enter may arrive as \n when input is piped.
@@ -2960,6 +3578,14 @@ fn handle_key(
                 );
             }
             KeyCode::Char('l') => *show_logs = !*show_logs,
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                *paused = true;
+                *hint = Some("paused - select and copy freely, o resumes".to_string());
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                *paused = false;
+                *hint = None;
+            }
             KeyCode::Char('r') => {
                 let cfg = s.cfg.clone();
                 let _ = s.restart(&cfg);
@@ -2990,36 +3616,66 @@ fn run_dashboard(mut s: Session) -> i32 {
     let mut view = View::Main;
     let mut show_logs = true;
     let mut hint: Option<String> = None;
+    let mut paused = false;
+    let mut redraw = true;
     let mut frame = 0usize;
     let mut exit_status = None;
+    let hw = fit::Hardware::probe(&s.dir);
+    // Parse an external draft once; built-in MTP needs no file.
+    let draft_meta = s.draft.as_ref().and_then(|p| {
+        std::fs::metadata(p)
+            .ok()
+            .map(|m| (p.clone(), gguf::parse(p), m.len()))
+    });
 
     loop {
-        // Snapshot under a short lock, then do slow I/O (nvidia-smi, /proc)
-        // outside it so the stderr reader is never starved.
-        let snapshot = { s.stats.lock().unwrap().clone() };
-        let gpu = server::gpu_info();
-        let ram = ram_text(s.info.pid);
-        let (cols, rows) = screen_size();
-        let screen = match &view {
-            View::Main => render_screen(
-                &s.model,
-                &s.info,
-                &snapshot,
-                gpu.as_ref(),
-                &ram,
-                &s.logpath,
-                show_logs,
-                frame,
-                hint.as_deref(),
-                cols,
-                rows,
-            ),
-            View::Help => render_help(&s.info, cols),
-        };
-        // Every line is clipped to the terminal width, so nothing wraps and
-        // there is no leftover text to smear; \x1b[J clears the rest.
-        print!("\x1b[H{}\x1b[J", screen.replace('\n', "\r\n"));
-        let _ = out.flush();
+        // While paused, stop repainting so the terminal selection survives and
+        // the card can be copied. State changes (p / o / l / help) still cause
+        // exactly one repaint so the PAUSED banner appears at once.
+        if !paused || redraw {
+            // Snapshot under a short lock, then do slow I/O (nvidia-smi, /proc)
+            // outside it so the stderr reader is never starved.
+            let snapshot = { s.stats.lock().unwrap().clone() };
+            let gpus = server::gpu_infos();
+            let ram = ram_text(s.info.pid);
+            let (cols, rows) = screen_size();
+            // Re-read every frame: the table is written in two parts (target,
+            // then draft), so a one-shot read can catch only the first one. The
+            // file head is small, so this is cheap.
+            let live = telemetry::read(&s.logpath);
+            let draft = draft_meta
+                .as_ref()
+                .map(|(_, meta, bytes)| mem::Draft { meta, weights: *bytes });
+            let plan = mem::plan(&s.model, draft, &s.cfg, &hw);
+            let screen = match &view {
+                View::Main => render_screen(
+                    &s.model,
+                    &s.info,
+                    &snapshot,
+                    draft_meta.is_some() || s.model.nextn,
+                    &gpus,
+                    &ram,
+                    &s.logpath,
+                    show_logs,
+                    frame,
+                    hint.as_deref(),
+                    paused,
+                    cols,
+                    rows,
+                    &s.cfg,
+                    &hw,
+                    &plan,
+                    live.as_ref(),
+                ),
+                View::Help => render_help(&s.info, cols),
+            };
+            // Every line is clipped to the terminal width, so nothing wraps and
+            // there is no leftover text to smear; each line is erased before it
+            // is redrawn.
+            print!("{}", paint_screen(&screen, cols));
+            let _ = out.flush();
+            redraw = false;
+        }
 
         if let Some(st) = s.exited() {
             exit_status = Some(st);
@@ -3027,16 +3683,18 @@ fn run_dashboard(mut s: Session) -> i32 {
         }
 
         let mut quit = false;
-        // Wait up to a second for input, then drain everything already queued:
-        // one render per burst keeps a fast key sequence responsive even when
-        // the frame itself (nvidia-smi) takes a while. Resize events just fall
-        // through to the next render, which re-reads the terminal size.
-        if event::poll(Duration::from_millis(500)).unwrap_or(false) {
+        // Wait for input, then drain everything already queued: one render per
+        // burst keeps a fast key sequence responsive even when the frame itself
+        // (nvidia-smi) takes a while. Resize events just fall through to the
+        // next render, which re-reads the terminal size.
+        let timeout = if paused { Duration::from_millis(250) } else { Duration::from_millis(500) };
+        if event::poll(timeout).unwrap_or(false) {
             loop {
                 if let Ok(Event::Key(k)) = event::read() {
-                    if handle_key(&mut s, &mut view, &mut show_logs, &mut hint, k) {
+                    if handle_key(&mut s, &mut view, &mut show_logs, &mut hint, &mut paused, k) {
                         quit = true;
                     }
+                    redraw = true;
                 }
                 if quit || !event::poll(Duration::from_millis(0)).unwrap_or(false) {
                     break;
@@ -3521,6 +4179,8 @@ mod tests {
             ncmoe: None,
             ctk: "q8_0".into(),
             ctv: "q8_0".into(),
+            draft_ctk: String::new(),
+            draft_ctv: String::new(),
             threads: None,
             reasoning: None,
             effort: None,
@@ -3528,6 +4188,10 @@ mod tests {
             extra: None,
             tools: None,
             draft_gpu: false,
+            kv_ram: false,
+            split_mode: "layer".into(),
+            tensor_split: None,
+            log_verbosity: 4,
             vision: false,
             mmproj: None,
             alias: None,
@@ -3535,6 +4199,7 @@ mod tests {
             temp: 1.0,
             top_p: 0.95,
             host: "127.0.0.1".into(),
+            ..Cfg::default()
         }
     }
 
@@ -3556,10 +4221,10 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-9B-Q6_K.gguf --alias Ornith-1.5-9B-Q6_K \
-             --ctx-size 262144 --parallel 1 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 262144 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
-             --metrics --cache-reuse 256 -ngl 99 --top-k 20 --min-p 0 --spec-type draft-mtp \
-             --spec-draft-n-max 2 --batch-size 1024 --ubatch-size 256"
+             --metrics --cache-reuse 256 --parallel 1 --log-verbosity 4 -ngl 99 --top-k 20 --min-p 0 \
+             --spec-type draft-mtp --spec-draft-n-max 2 --batch-size 1024 --ubatch-size 256"
         );
     }
 
@@ -3570,10 +4235,10 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-35B-A3B-Q6_K.gguf --alias Ornith-1.5-35B-A3B-Q6_K \
-             --ctx-size 131072 --parallel 1 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 131072 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
-             --metrics --cache-reuse 256 -ngl 99 --n-cpu-moe 58 --batch-size 2048 \
-             --ubatch-size 512 --spec-type draft-mtp --spec-draft-n-max 3"
+             --metrics --cache-reuse 256 --batch-size 2048 --ubatch-size 512 --parallel 1 \
+             --log-verbosity 4 -ngl 99 --n-cpu-moe 58 --spec-type draft-mtp --spec-draft-n-max 3"
         );
     }
 
@@ -3586,10 +4251,11 @@ mod tests {
         assert_eq!(
             argv(&m, Some("/nonexistent/nemo-LiLiCorr.gguf"), &c),
             "-m /nonexistent/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
-             --alias NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB --ctx-size 131072 --parallel 1 \
+             --alias NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB --ctx-size 131072 \
              --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
-             --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 -ngl 999 \
-             --n-cpu-moe 58 --batch-size 2048 --ubatch-size 512 --spec-type draft-dflash \
+             --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 --batch-size 2048 \
+             --ubatch-size 512 --parallel 1 --log-verbosity 4 -ngl 999 \
+             --n-cpu-moe 58 --spec-type draft-dflash \
              --spec-draft-model /nonexistent/nemo-LiLiCorr.gguf --spec-draft-ngl 999 \
              --spec-draft-n-max 7"
         );
@@ -3608,13 +4274,77 @@ mod tests {
         assert_eq!(
             argv(&m, Some("/nonexistent/mtp-gemma-4-12b-it-Q8_0.gguf"), &c),
             "-m /nonexistent/gemma-4-12b-it.gguf --alias gemma-4-12b-it \
-             --ctx-size 262144 --parallel 1 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 262144 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
-             --mmproj /nonexistent/mmproj-F16.gguf --metrics --cache-reuse 256 -ngl 99 \
+             --mmproj /nonexistent/mmproj-F16.gguf --metrics --cache-reuse 256 --parallel 1 \
+             --log-verbosity 4 -ngl 99 \
              --top-k 64 --min-p 0 --spec-type draft-mtp \
              --spec-draft-model /nonexistent/mtp-gemma-4-12b-it-Q8_0.gguf \
              --spec-draft-ngl 999 --spec-draft-n-max 4 --batch-size 1024 --ubatch-size 256"
         );
+    }
+
+    #[test]
+    fn placement_knobs_reach_argv_without_extra() {
+        // These used to be reachable only by hand-writing `extra`; they are
+        // first-class settings now and must actually be emitted.
+        let m = test_model("Ornith-1.5-35B-A3B-Q6_K", 40, true, false);
+        let mut c = test_cfg();
+        c.load_mode = Some("none".into());
+        c.moe_cache_mib = Some(2048);
+        c.cpu_moe = true;
+        c.n_cpu_ffn = Some(4);
+        c.override_tensor = Some("blk\\.1\\.ffn_up=CPU".into());
+        c.lazy_mode = Some("off".into());
+        c.numa = Some("isolate".into());
+        c.no_op_offload = true;
+        c.batch_size = Some(1024);
+        c.ubatch_size = Some(256);
+        c.parallel = Some(2);
+        c.threads_batch = Some(8);
+        c.prio = Some(1);
+        c.cache_reuse = Some(0);
+        c.draft_n_min = Some(1);
+        c.draft_p_min = Some(0.5);
+        c.top_k = Some(20);
+        c.min_p = Some(0.05);
+        c.repeat_penalty = Some(1.1);
+        c.presence_penalty = Some(0.2);
+        c.frequency_penalty = Some(0.3);
+        c.seed = Some(42);
+        c.api_key = Some("secret".into());
+        c.timeout = Some(60);
+        c.threads_http = Some(4);
+        let a = argv(&m, None, &c);
+        for needle in [
+            "--load-mode none",
+            "--moe-cache-mib 2048",
+            "--cpu-moe",
+            "--n-cpu-ffn 4",
+            "--override-tensor blk\\.1\\.ffn_up=CPU",
+            "--lazy-mode off",
+            "--numa isolate",
+            "--no-op-offload",
+            "--batch-size 1024",
+            "--ubatch-size 256",
+            "--parallel 2",
+            "--threads-batch 8",
+            "--prio 1",
+            "--cache-reuse 0",
+            "--spec-draft-n-min 1",
+            "--spec-draft-p-min 0.5",
+            "--top-k 20",
+            "--min-p 0.05",
+            "--repeat-penalty 1.1",
+            "--presence-penalty 0.2",
+            "--frequency-penalty 0.3",
+            "--seed 42",
+            "--api-key secret",
+            "--timeout 60",
+            "--threads-http 4",
+        ] {
+            assert!(a.contains(needle), "missing `{needle}` in {a}");
+        }
     }
 
     #[test]
@@ -3626,9 +4356,10 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-9B-AD-Q8_0-Q6_K.gguf \
-             --alias Ornith-1.5-9B-AD-Q8_0-Q6_K --ctx-size 262144 --parallel 1 \
+             --alias Ornith-1.5-9B-AD-Q8_0-Q6_K --ctx-size 262144 \
              --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
-             --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 -ngl 99 \
+             --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 --parallel 1 \
+             --log-verbosity 4 -ngl 99 \
              --top-k 20 --min-p 0 --batch-size 1024 --ubatch-size 256"
         );
     }
@@ -3700,10 +4431,10 @@ mod tests {
     #[test]
     fn warning_lines_stay_warnings() {
         // llama.cpp's auto-fit warning contains "failed" but is level W.
-        let w = log_line("0.00.933.092 W common_fit_params: failed to fit params to free device memory");
+        let w = log_line_w("0.00.933.092 W common_fit_params: failed to fit params to free device memory", 68);
         assert!(w.contains(YELLOW), "{w}");
         assert!(!w.contains(RED), "{w}");
-        let e = log_line("0.01.000.000 E srv load_model: failed to load model");
+        let e = log_line_w("0.01.000.000 E srv load_model: failed to load model", 68);
         assert!(e.contains(RED), "{e}");
     }
 
@@ -3730,5 +4461,136 @@ mod tests {
         let packs = strata_packs_from(text);
         assert_eq!(packs.len(), 1);
         assert_eq!(packs[0], ("qwen36".to_string(), "ud-q4_k_xl".to_string()));
+    }
+
+    /// Every line of a box must be exactly `cols` wide or narrower, and the
+    /// top border must line up with the body and the bottom border. The old
+    /// code was two cells too wide and one cell short on top.
+    fn assert_box_width(card: &str, cols: usize) {
+        for line in card.lines() {
+            let w = vlen(line);
+            // Strictly narrower than the terminal: a full-width line leaves
+            // the terminal in wrap-pending state and shifts the next row.
+            assert!(w < cols, "line is {w} cells, terminal is {cols}: {line:?}");
+        }
+        let mut lines = card.lines();
+        let top = lines.next().expect("top border");
+        let rest: Vec<&str> = lines.collect();
+        let body = rest.iter().find(|l| l.starts_with('│')).expect("body row");
+        assert_eq!(vlen(top), vlen(body), "top border vs body:\n{top}\n{body}");
+    }
+
+    #[test]
+    fn boxed_card_fits_the_terminal() {
+        let body = vec![
+            format!("  {}", "x".repeat(60)),
+            "  short".to_string(),
+            format!("  {}", "y".repeat(10)),
+        ];
+        for cols in [40usize, 60, 80, 100, 120] {
+            let card = boxed("title", &body, "footer", cols);
+            assert_box_width(&card, cols);
+            let top = card.lines().next().unwrap();
+            let body_row = card.lines().find(|l| l.starts_with('│')).unwrap();
+            assert_eq!(vlen(top), vlen(body_row));
+        }
+    }
+
+    #[test]
+    fn boxed_long_title_is_clipped_to_fit() {
+        let title = "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-with-a-very-long-name";
+        let card = boxed(title, &["  body".to_string()], "", 50);
+        assert_box_width(&card, 50);
+    }
+
+    #[test]
+    fn paint_erases_every_line_and_clips_to_the_terminal() {
+        let out = paint_screen("aaa\nbbb\n", 10);
+        assert_eq!(out.matches("\x1b[2K").count(), 2, "{out:?}");
+        assert!(out.contains("aaa\r\n"), "{out:?}");
+        // cols - 1 cells at most: the last column stays free so the terminal
+        // never auto-wraps and shifts the following row.
+        let wide = paint_screen(&"x".repeat(30), 10);
+        assert!(!wide.contains(&"x".repeat(10)), "{wide:?}");
+        assert!(wide.contains(&"x".repeat(9)), "{wide:?}");
+    }
+
+    #[test]
+    fn live_card_shows_draft_acceptance_and_mmap_warning() {
+        let m = test_model("nemotron", 88, true, false);
+        let hw = fit::Hardware {
+            ram_total_gb: 64.0,
+            ram_avail_gb: 32.0,
+            vram_total_gb: 24.0,
+            disk_free_gb: 2000.0,
+            gpus: vec![("GPU0".into(), 24.0)],
+        };
+        let cfg = test_cfg();
+        let plan = mem::plan(&m, None, &cfg, &hw);
+        let info = Info {
+            alias: "nemotron".into(),
+            port: 8080,
+            pid: 0,
+            ctx: 131072,
+            ctk: "q8_0".into(),
+            ctv: "q8_0".into(),
+        };
+        let ram = RamText {
+            system: "8/64 GiB".into(),
+            server: "1 GiB rss".into(),
+            short: "1 GiB".into(),
+        };
+        let mut s = Stats::default();
+        s.last_draft_accept = Some(0.62);
+        s.last_draft_mean = Some(2.4);
+        s.last_draft_per_pos = vec![0.8, 0.6];
+        let live = telemetry::LoadInfo { mmap_cpu_experts: true, ..Default::default() };
+        let screen = render_screen(
+            &m,
+            &info,
+            &s,
+            false,
+            &[],
+            &ram,
+            Path::new("/tmp/nonexistent.log"),
+            false,
+            0,
+            None,
+            false,
+            100,
+            50,
+            &cfg,
+            &hw,
+            &plan,
+            Some(&live),
+        );
+        assert!(screen.contains("Draft accept"), "{screen}");
+        assert!(screen.contains("62%"), "{screen}");
+        assert!(screen.contains("from SSD"), "{screen}");
+        assert_box_width(&screen, 100);
+
+        // Before the first request there is no acceptance number yet, but the
+        // row must still be visible when the model has a draft/MTP head.
+        let empty = Stats::default();
+        let idle = render_screen(
+            &m,
+            &info,
+            &empty,
+            true,
+            &[],
+            &ram,
+            Path::new("/tmp/nonexistent.log"),
+            false,
+            0,
+            None,
+            false,
+            100,
+            50,
+            &cfg,
+            &hw,
+            &plan,
+            Some(&live),
+        );
+        assert!(idle.contains("waiting for the first request"), "{idle}");
     }
 }

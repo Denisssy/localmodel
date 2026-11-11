@@ -26,6 +26,7 @@
 //! fast.
 use std::path::Path;
 
+use crate::Cfg;
 use crate::gguf;
 use crate::server;
 
@@ -33,21 +34,16 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 
 /// GGUF weights grow a little when loaded (alignment, duplicated tied
 /// embeddings, the output tensor). Measured 7.04 GiB file → ~7.11 GiB resident.
-const WEIGHT_LOAD_FACTOR: f64 = 1.01;
+pub(crate) const WEIGHT_LOAD_FACTOR: f64 = 1.01;
 /// Compute buffers (graph, logits, batch) and the CUDA context, together.
 /// Calibrated 2026-11-08 on this box against Ornith-1.5-9B-Q6_K at 262144
 /// tokens, q8_0/q8_0 with the built-in MTP head: weights 7.11 + KV 4.78 +
 /// 1.55 = 13.44 GiB, while llama-server reported 14009 MiB (13.68 GiB).
 /// The 0.24 GiB gap is inside the "fits" margin on purpose; the verdict is
 /// meant to be conservative, not exact to the last frame.
-const COMPUTE_GB: f64 = 1.25;
-const CUDA_CTX_GB: f64 = 0.30;
-/// Less than this much free VRAM after loading counts as "tight".
+pub(crate) const COMPUTE_GB: f64 = 1.25;
+pub(crate) const CUDA_CTX_GB: f64 = 0.30;/// Less than this much free VRAM after loading counts as "tight".
 const TIGHT_GB: f64 = 1.0;
-
-/// Context sizes worth suggesting. llama.cpp handles the 2^n sizes best;
-/// 196608 is the 3×65536 step that Qwen-family models use.
-const CTX_STEPS: &[u32] = &[4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144];
 
 /// Bytes per KV-cache element for a llama.cpp `--cache-type-*` name.
 ///
@@ -81,6 +77,57 @@ pub struct DraftKv<'a> {
     pub ctv: &'a str,
 }
 
+/// Scan a raw `extra` string for the draft cache-type override flags.
+fn scan_extra(extra: &str, keys: &[&str]) -> Option<String> {
+    let toks: Vec<&str> = extra.split_whitespace().collect();
+    toks.iter()
+        .enumerate()
+        .find_map(|(i, t)| {
+            if let Some((k, v)) = t.split_once('=') {
+                if keys.contains(&k) && !v.is_empty() {
+                    return Some(v.to_string());
+                }
+            }
+            if keys.contains(t) {
+                if let Some(v) = toks.get(i + 1) {
+                    return Some((*v).to_string());
+                }
+            }
+            None
+        })
+}
+
+/// Resolve the draft / MTP context cache types.
+///
+/// The draft has its own flags (`-ctkd` / `-ctvd`, long forms
+/// `--cache-type-k-draft` / `--cache-type-v-draft`) and they default to
+/// `f16`; the draft does **not** inherit the target's `--cache-type-k/v`.
+/// Priority: the explicit `draft_ctk`/`draft_ctv` knobs > a matching flag in
+/// the profile's `extra` > llama.cpp's own default (`f16`). The draft cache
+/// types only matter for a model that actually has a draft head, so the hub
+/// keeps calling this for every model — an empty result simply renders as
+/// `f16/f16`.
+pub fn draft_kv_types(c: &Cfg) -> (String, String) {
+    // Priority: the explicit knob > a matching `extra` flag > the f16 engine
+    // default. `engine` resolves a single flag pair from `extra`.
+    let engine = |extra: Option<&str>, flag: &[&str]| -> String {
+        scan_extra(extra.unwrap_or(""), flag).unwrap_or_else(|| "f16".into())
+    };
+    let k_flags = ["-ctkd", "--cache-type-k-draft", "--spec-draft-type-k"];
+    let v_flags = ["-ctvd", "--cache-type-v-draft", "--spec-draft-type-v"];
+    let k = if c.draft_ctk.is_empty() {
+        engine(c.extra.as_deref(), &k_flags)
+    } else {
+        c.draft_ctk.clone()
+    };
+    let v = if c.draft_ctv.is_empty() {
+        engine(c.extra.as_deref(), &v_flags)
+    } else {
+        c.draft_ctv.clone()
+    };
+    (k, v)
+}
+
 /// KV bytes at `ctx` for one set of layers. Sliding-window layers stop
 /// growing once the window is full; that is why a 262K Gemma context does not
 /// cost 256× the KV of a 1K one.
@@ -105,7 +152,7 @@ fn layer_bytes(
         .sum()
 }
 
-fn kv_usage_gb(
+pub(crate) fn kv_usage_gb(
     meta: &gguf::Meta,
     draft: Option<&DraftKv>,
     ctx: u32,
@@ -169,12 +216,16 @@ pub fn for_gguf(
     ctk: &str,
     ctv: &str,
     draft: Option<DraftKv<'_>>,
+    kv_ram: bool,
 ) -> GgufEstimate {
     let draft_weights = draft.map(|d| d.weights_bytes).unwrap_or(0);
     let weights_gb = (weights_bytes.saturating_add(draft_weights)) as f64 / GIB * WEIGHT_LOAD_FACTOR;
     let (kv_main_gb, kv_draft_gb) = kv_usage_gb(meta, draft.as_ref(), ctx, ctk, ctv);
     let overhead_gb = COMPUTE_GB + CUDA_CTX_GB;
-    let need_vram_gb = weights_gb + kv_main_gb + kv_draft_gb + overhead_gb;
+    // `--no-kv-offload` keeps the cache in host memory, so it must not count
+    // against the card even though it still costs the same bytes.
+    let kv_vram = if kv_ram { 0.0 } else { kv_main_gb + kv_draft_gb };
+    let need_vram_gb = weights_gb + kv_vram + overhead_gb;
     let room_gb = hw.vram_room_gb();
 
     let (verdict, why) = if hw.vram_total_gb <= 0.0 {
@@ -195,8 +246,15 @@ pub fn for_gguf(
         };
         let mut why = format!(
             "{:.1} GB weights + {:.1} GB KV + {:.1} GB overhead = {:.1} GB of {:.1} GB usable",
-            weights_gb, kv_main_gb + kv_draft_gb, overhead_gb, need_vram_gb, room_gb
+            weights_gb,
+            kv_main_gb + kv_draft_gb,
+            overhead_gb,
+            need_vram_gb,
+            room_gb
         );
+        if kv_ram {
+            why.push_str("; KV in host RAM (--no-kv-offload)");
+        }
         if slack >= 0.0 {
             why.push_str(&format!("; {:.1} GB spare", slack));
         } else {
@@ -221,6 +279,15 @@ pub fn for_gguf(
 
 /// Largest standard context size that still fits, capped by the model's
 /// training context. 0 means even the smallest step does not fit.
+/// Context sizes worth suggesting. llama.cpp handles the 2^n sizes best;
+/// 196608 is the 3×65536 step that Qwen-family models use.
+const CTX_STEPS: &[u32] = &[4096, 8192, 16384, 32768, 65536, 131072, 196608, 262144];
+
+/// Largest context that fits if every weight is on the card.
+///
+/// Kept for the "what would fit without expert offload" comparison; the hub
+/// uses `mem::max_ctx`, which accounts for `--n-cpu-moe` placement.
+#[allow(dead_code)]
 pub fn suggest_ctx(
     meta: &gguf::Meta,
     weights_bytes: u64,
@@ -228,6 +295,7 @@ pub fn suggest_ctx(
     ctk: &str,
     ctv: &str,
     draft: Option<DraftKv<'_>>,
+    kv_ram: bool,
 ) -> u32 {
     let draft_weights = draft.map(|d| d.weights_bytes).unwrap_or(0);
     let weights_gb = (weights_bytes.saturating_add(draft_weights)) as f64 / GIB * WEIGHT_LOAD_FACTOR;
@@ -242,7 +310,8 @@ pub fn suggest_ctx(
             continue;
         }
         let (main, draft_gb) = kv_usage_gb(meta, draft.as_ref(), step, ctk, ctv);
-        if weights_gb + overhead_gb + main + draft_gb <= room_gb {
+        let kv = if kv_ram { 0.0 } else { main + draft_gb };
+        if weights_gb + overhead_gb + kv <= room_gb {
             return step;
         }
     }
@@ -257,6 +326,22 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// Verdict for an already-computed placement (`need` vs usable `room`).
+    pub fn for_slack(need_gb: f64, room_gb: f64) -> Self {
+        if room_gb <= 0.0 {
+            Verdict::No
+        } else {
+            let slack = room_gb - need_gb;
+            if slack >= TIGHT_GB {
+                Verdict::Fits
+            } else if slack >= 0.0 {
+                Verdict::Tight
+            } else {
+                Verdict::No
+            }
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Verdict::Fits => "fits",
@@ -279,6 +364,9 @@ pub struct Hardware {
     pub ram_avail_gb: f64,
     pub vram_total_gb: f64,
     pub disk_free_gb: f64,
+    /// `(name, total_gb)` for each CUDA device. Empty when nvidia-smi is not
+    /// available, in which case `vram_total_gb` is authoritative.
+    pub gpus: Vec<(String, f64)>,
 }
 
 impl Hardware {
@@ -290,23 +378,36 @@ impl Hardware {
             ),
             None => (0.0, 0.0),
         };
-        let (vram_total_gb, _vram_used_gb) = match server::gpu_mem() {
-            Some((used, total)) => (total / 1024.0, used / 1024.0),
-            None => (0.0, 0.0),
+        let gpus: Vec<(String, f64)> = server::gpu_infos()
+            .into_iter()
+            .map(|g| (g.name, g.mem_total / 1024.0))
+            .collect();
+        let vram_total_gb = if gpus.is_empty() {
+            match server::gpu_mem() {
+                Some((_used, total)) => total / 1024.0,
+                None => 0.0,
+            }
+        } else {
+            gpus.iter().map(|(_, gb)| gb).sum()
         };
         Self {
             ram_total_gb,
             ram_avail_gb,
             vram_total_gb,
             disk_free_gb: disk_free_gb(models_dir),
+            gpus,
         }
     }
 
-    /// VRAM the model may actually use for planning: the card minus a small
+    /// VRAM the model may actually use for planning: every card minus a small
     /// desktop baseline. Deliberately not `total - used`, because when a model
     /// is already serving, its own weights are the "used" part.
     pub fn vram_room_gb(&self) -> f64 {
-        (self.vram_total_gb - 0.9).max(0.0)
+        if self.gpus.is_empty() {
+            (self.vram_total_gb - 0.9).max(0.0)
+        } else {
+            self.gpus.iter().map(|(_, gb)| (gb - 0.9).max(0.0)).sum()
+        }
     }
 }
 
@@ -595,6 +696,7 @@ mod tests {
             ram_avail_gb: 32.0,
             vram_total_gb,
             disk_free_gb: 2000.0,
+            gpus: if vram_total_gb > 0.0 { vec![("test".into(), vram_total_gb)] } else { Vec::new() },
         }
     }
 
@@ -618,6 +720,7 @@ mod tests {
                 draft: vec![attn(4, 256, 256, false)],
                 swa_window: 0,
             },
+            ..Default::default()
         }
     }
 
@@ -655,6 +758,7 @@ mod tests {
             "q8_0",
             "q8_0",
             Some(builtin_draft(&meta, "q8_0", "q8_0")),
+            false,
         );
         // The plan's check: 9 attention layers (8 main + 1 MTP) at q8_0.
         assert!((e.kv_main_gb - 4.25).abs() < 0.02, "main KV {}", e.kv_main_gb);
@@ -668,12 +772,12 @@ mod tests {
     fn ornith_9b_ctx_suggestion_respects_the_card() {
         let meta = ornith_9b();
         let draft = builtin_draft(&meta, "q8_0", "q8_0");
-        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(15.5), "q8_0", "q8_0", Some(draft)), 262144);
+        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(15.5), "q8_0", "q8_0", Some(draft), false), 262144);
         // A 12 GB card leaves ~11.1 GiB; after 7.1 weights and 1.55 overhead
         // only ~2.4 GiB is left, which is the 131072 step, not 262144.
-        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(12.0), "q8_0", "q8_0", Some(draft)), 131072);
+        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(12.0), "q8_0", "q8_0", Some(draft), false), 131072);
         // An 8 GB card cannot hold the weights at all.
-        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(8.0), "q8_0", "q8_0", Some(draft)), 0);
+        assert_eq!(suggest_ctx(&meta, 7_558_901_696, &hw(8.0), "q8_0", "q8_0", Some(draft), false), 0);
     }
 
     #[test]
@@ -698,13 +802,14 @@ mod tests {
             ctx_train: 131072,
             nextn_layers: 0,
             kv: KvGeometry { main: vec![attn(8, 128, 128, false)], draft: vec![], swa_window: 0 },
+            ..Default::default()
         };
-        let mixed = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "q8_0", "f16", None);
-        let q8_both = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "q8_0", "q8_0", None);
+        let mixed = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "q8_0", "f16", None, false);
+        let q8_both = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "q8_0", "q8_0", None, false);
         // V in f16 is almost twice the size of V in q8_0, so the mixed cache
         // must be bigger than q8_0/q8_0, and smaller than f16/f16.
         assert!(mixed.kv_main_gb > q8_both.kv_main_gb);
-        let f16_both = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "f16", "f16", None);
+        let f16_both = for_gguf(&meta, 1 << 30, &hw(24.0), 131072, "f16", "f16", None, false);
         assert!(mixed.kv_main_gb < f16_both.kv_main_gb);
     }
 
@@ -719,9 +824,39 @@ mod tests {
             ctx_train: 4096,
             nextn_layers: 0,
             kv: KvGeometry::default(),
+            ..Default::default()
         };
-        let e = for_gguf(&meta, 4 << 30, &hw(24.0), 4096, "q8_0", "q8_0", None);
+        let e = for_gguf(&meta, 4 << 30, &hw(24.0), 4096, "q8_0", "q8_0", None, false);
         assert_eq!(e.verdict, Verdict::No);
         assert!(e.why.contains("KV geometry"));
     }
+    #[test]
+    fn draft_kv_defaults_to_f16_and_reads_extra() {
+        assert_eq!(draft_kv_types(&Cfg::default()), ("f16".into(), "f16".into()));
+    }
+
+    #[test]
+    fn draft_kv_prefers_the_knob_over_extra_then_f16() {
+        // The explicit knob wins even when extra also names a draft flag.
+        let with_knob = Cfg {
+            draft_ctk: "q8_0".into(),
+            draft_ctv: "q8_0".into(),
+            ..Cfg::default()
+        };
+        assert_eq!(draft_kv_types(&with_knob), ("q8_0".into(), "q8_0".into()));
+
+        // Without the knob, `extra` overrides win.
+        let with_extra = Cfg {
+            extra: Some("--batch-size 1024 -ctkd q4_0 -ctvd q8_0".into()),
+            ..Cfg::default()
+        };
+        assert_eq!(draft_kv_types(&with_extra), ("q4_0".into(), "q8_0".into()));
+
+        let eq = Cfg {
+            extra: Some("--cache-type-k-draft=q5_1".into()),
+            ..Cfg::default()
+        };
+        assert_eq!(draft_kv_types(&eq), ("q5_1".into(), "f16".into()));
+    }
+
 }
