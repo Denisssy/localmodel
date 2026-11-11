@@ -62,7 +62,7 @@ fn collect(dir: &Path, out: &mut Vec<Model>) {
         let quant = if name_quant == "unknown" { meta.quant.clone() } else { name_quant };
         let quant = if quant.is_empty() { "unknown".to_string() } else { quant };
         let layers = meta.layers;
-        let (moe, experts_total, experts_active) = detect_moe(&name);
+        let (moe, experts_total, experts_active) = detect_moe(&name, &meta);
         out.push(Model {
             path: p,
             name,
@@ -78,8 +78,22 @@ fn collect(dir: &Path, out: &mut Vec<Model>) {
     }
 }
 
-fn detect_moe(name: &str) -> (bool, u32, u32) {
+fn detect_moe(name: &str, meta: &gguf::Meta) -> (bool, u32, u32) {
     let n = name.to_lowercase();
+    // Authoritative: `llama.model_type` (2 = MoE) when the file declares it.
+    if meta.model_type == 2 {
+        return (true, meta.experts_total, meta.experts_active);
+    }
+    // Architecture suffix marks MoE (qwen35moe, qwen3_moe) even when
+    // `llama.model_type` is absent — that is how Ornith-1.5-35B-A3B is told.
+    if meta.arch.contains("_moe") {
+        return (true, meta.experts_total, meta.experts_active);
+    }
+    // The file explicitly lists routed experts; a tensor table with
+    // `*_exps` tensors is MoE by definition.
+    if meta.experts_total > 0 || meta.experts_active > 0 {
+        return (true, meta.experts_total, meta.experts_active);
+    }
     // Active-param notation (e.g. 74B-A9B), classic MoE names, and Nemotron.
     let active_notation = ["a3b", "a9b", "a12b", "a22b", "a35b"]
         .iter()
@@ -160,4 +174,55 @@ pub fn human(bytes: u64) -> String {
 
 pub fn stem(name: &str) -> String {
     name.trim_end_matches(".gguf").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::Meta;
+
+    fn dense_meta() -> Meta {
+        Meta::default()
+    }
+
+    #[test]
+    fn moe_from_arch_suffix_without_model_type() {
+        // Ornith-1.5-35B-A3B: name has no "a3b"/"moe" marker, arch is qwen35moe.
+        let (moe, total, active) = detect_moe("Ornith-1.5-35B-Q4_K_M.gguf", &Meta {
+            arch: "qwen35moe".into(),
+            experts_total: 256,
+            experts_active: 8,
+            ..Meta::default()
+        });
+        assert!(moe, "qwen35moe must be detected as MoE");
+        assert_eq!((total, active), (256, 8));
+    }
+
+    #[test]
+    fn moe_from_llama_model_type() {
+        let (moe, total, active) = detect_moe("whatever.gguf", &Meta {
+            model_type: 2,
+            experts_total: 16,
+            experts_active: 4,
+            ..Meta::default()
+        });
+        assert!(moe);
+        assert_eq!((total, active), (16, 4));
+    }
+
+    #[test]
+    fn dense_when_no_marker_and_no_metadata() {
+        let (moe, total, active) = detect_moe("Llama-3.1-8B-Q4_K_M.gguf", &dense_meta());
+        assert!(!moe);
+        assert_eq!((total, active), (0, 0));
+    }
+
+    #[test]
+    fn active_param_notation_still_works() {
+        let (moe, total, active) = detect_moe("NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf", &dense_meta());
+        assert!(moe);
+        // Active-param notation flags MoE; the total is unknown unless the
+        // name is mixtral-style (8x7b).
+        assert_eq!((total, active), (0, 0));
+    }
 }

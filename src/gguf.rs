@@ -101,6 +101,15 @@ pub struct Meta {
     pub ctx_train: u32,
     /// Number of built-in MTP/nextn blocks.
     pub nextn_layers: u32,
+    /// `llama.model_type`: 1 = dense, 2 = MoE. 0 when the file does not
+    /// declare it; then the architecture suffix (`_moe`, e.g. `qwen35moe`)
+    /// is what decides dense vs MoE.
+    pub model_type: u8,
+    /// Total routed experts (`<arch>.expert_count`), if the file says so.
+    pub experts_total: u32,
+    /// Active experts per token (`<arch>.expert_used_count`), if the file
+    /// says so.
+    pub experts_active: u32,
     /// Per-block KV shape, used by `fit::for_gguf`.
     pub kv: KvGeometry,
     /// Bytes of the tensors that belong to each block (`blk.N.*`). Empty when
@@ -133,6 +142,12 @@ struct RawMeta {
     nextn_layers: Option<u32>,
     swa_window: Option<u32>,
     swa_pattern: Option<Vec<bool>>,
+    /// `llama.model_type` (1 dense, 2 MoE); 0 when absent.
+    model_type: Option<u64>,
+    /// Total routed experts (`<arch>.expert_count`).
+    expert_count: Option<u32>,
+    /// Active experts per token (`<arch>.expert_used_count`).
+    expert_used_count: Option<u32>,
 }
 
 /// Parse layer count (from blk.N tensor names) and the dominant tensor
@@ -146,6 +161,9 @@ pub fn parse(path: &Path) -> Meta {
         block_count: 0,
         ctx_train: 0,
         nextn_layers: 0,
+        model_type: 0,
+        experts_total: 0,
+        experts_active: 0,
         kv: KvGeometry::default(),
         block_bytes: Vec::new(),
         block_expert_bytes: Vec::new(),
@@ -263,6 +281,9 @@ pub fn parse(path: &Path) -> Meta {
     meta.block_count = raw.block_count.filter(|&v| v > 0).unwrap_or(meta.layers);
     meta.ctx_train = raw.ctx_train.unwrap_or(0);
     meta.nextn_layers = raw.nextn_layers.unwrap_or(if meta.nextn { 1 } else { 0 });
+    meta.model_type = raw.model_type.map(|v| v as u8).unwrap_or(0);
+    meta.experts_total = raw.expert_count.unwrap_or(0);
+    meta.experts_active = raw.expert_used_count.unwrap_or(0);
     meta.kv = build_kv(&raw, meta.block_count, meta.nextn_layers);
     let n = meta.block_count as usize;
     blocks.resize(n, 0);
@@ -295,7 +316,11 @@ fn capture_kv(c: &mut Cursor, key: &[u8], vt: u32, raw: &mut RawMeta) -> bool {
         None => return false,
     };
     let is_u32 = matches!(vt, 4 | 5);
+    let is_u64 = matches!(vt, 10 | 11 | 12);
     match field {
+        "model_type" if is_u64 => raw.model_type = read_u64(c, vt),
+        "expert_count" if is_u32 => raw.expert_count = read_u32(c, vt),
+        "expert_used_count" if is_u32 => raw.expert_used_count = read_u32(c, vt),
         "block_count" if is_u32 => raw.block_count = read_u32(c, vt),
         "context_length" if is_u32 => raw.ctx_train = read_u32(c, vt),
         "embedding_length" if is_u32 => raw.n_embd = read_u32(c, vt),
@@ -319,6 +344,13 @@ fn capture_kv(c: &mut Cursor, key: &[u8], vt: u32, raw: &mut RawMeta) -> bool {
 fn read_u32(c: &mut Cursor, vt: u32) -> Option<u32> {
     match vt {
         4 | 5 => c.u32(),
+        _ => None,
+    }
+}
+
+fn read_u64(c: &mut Cursor, vt: u32) -> Option<u64> {
+    match vt {
+        10 | 11 | 12 => c.u64(),
         _ => None,
     }
 }
@@ -654,6 +686,12 @@ mod tests {
         out.extend_from_slice(&v.to_le_bytes());
     }
 
+    fn put_u64(out: &mut Vec<u8>, key: &str, v: u64) {
+        put_str(out, key);
+        out.extend_from_slice(&12u32.to_le_bytes());
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+
     fn put_str_val(out: &mut Vec<u8>, key: &str, v: &str) {
         put_str(out, key);
         out.extend_from_slice(&8u32.to_le_bytes());
@@ -784,5 +822,45 @@ mod tests {
         // Only the last block owns a KV cache.
         assert_eq!(m.kv.main.len(), 1);
         assert_eq!(m.kv.main[0], KvLayer { heads: 2, k: 128, v: 128, swa: false });
+    }
+
+    #[test]
+    fn parses_llama_model_type_and_expert_counts() {
+        // Like Ornith-1.5-35B-A3B: qwen35moe fields, a MoE model_type, but no
+        // `llama.model_type`-style entry — the parser must still read both.
+        let path = write_gguf(
+            "orin",
+            |b| {
+                put_str_val(b, "general.architecture", "qwen35moe");
+                put_u32(b, "qwen35moe.block_count", 41);
+                put_u64(b, "llama.model_type", 2);
+                put_u32(b, "qwen35moe.expert_count", 256);
+                put_u32(b, "qwen35moe.expert_used_count", 8);
+            },
+            5,
+        );
+        let m = parse(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(m.arch, "qwen35moe");
+        assert_eq!(m.model_type, 2);
+        assert_eq!(m.experts_total, 256);
+        assert_eq!(m.experts_active, 8);
+    }
+
+    #[test]
+    fn missing_model_type_leaves_dense_defaults() {
+        let path = write_gguf(
+            "dense",
+            |b| {
+                put_str_val(b, "general.architecture", "llama");
+                put_u32(b, "llama.block_count", 32);
+            },
+            3,
+        );
+        let m = parse(&path);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(m.model_type, 0);
+        assert_eq!(m.experts_total, 0);
+        assert_eq!(m.experts_active, 0);
     }
 }
