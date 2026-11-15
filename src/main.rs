@@ -543,8 +543,8 @@ fn strata_packs() -> Vec<(String, String)> {
 }
 
 /// A named side profile (e.g. an agent variant) attached to a model, for the
-/// picker: (profile key, model file stem, profile).
-fn side_profiles(saved: &settings::Settings, ms: &[Model]) -> Vec<(String, String)> {
+/// picker and the hub: (profile key, model file stem, profile).
+pub(crate) fn side_profiles(saved: &settings::Settings, ms: &[Model]) -> Vec<(String, String)> {
     let stems: Vec<String> = ms.iter().map(|m| models::stem(&m.name)).collect();
     saved
         .model

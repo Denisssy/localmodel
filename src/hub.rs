@@ -73,6 +73,9 @@ fn leave() {
 #[derive(Clone, PartialEq, Eq)]
 enum Entry {
     Model(usize),
+    /// A named side profile: (model index, profile key). Edits and saves go
+    /// to the profile key; launch runs it via `--profile key model`.
+    Profile(usize, String),
     Pack(String, String),
     Add,
 }
@@ -83,13 +86,16 @@ enum Focus {
     Settings,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum Overlay {
     None,
     Help,
     Argv,
+    /// Name input for "save current edits as a profile" (key `p`).
+    SaveAs(Edit),
 }
 
+#[derive(Clone, PartialEq, Eq)]
 struct Edit {
     buf: String,
     /// The first typed character replaces the pre-filled value.
@@ -137,6 +143,8 @@ struct ArgvView {
 
 enum Launch {
     Run(String),
+    /// A named side profile: (profile key, model name to resolve).
+    Profile(String, String),
     Strata(String, String),
 }
 
@@ -218,7 +226,16 @@ impl Hub {
                 .map(|m| m.path.clone())
                 .collect()
         };
-        self.entries = (0..self.ms.len()).map(Entry::Model).collect();
+        self.entries = Vec::new();
+        for i in 0..self.ms.len() {
+            self.entries.push(Entry::Model(i));
+            let stem = models::stem(&self.ms[i].name);
+            for (key, target) in crate::side_profiles(&self.work, &self.ms) {
+                if target == stem {
+                    self.entries.push(Entry::Profile(i, key));
+                }
+            }
+        }
         for (f, s) in &self.packs {
             self.entries.push(Entry::Pack(f.clone(), s.clone()));
         }
@@ -271,6 +288,7 @@ impl Hub {
     fn current_model(&self) -> Option<&Model> {
         match self.current()? {
             Entry::Model(i) => self.ms.get(*i),
+            Entry::Profile(i, _) => self.ms.get(*i),
             _ => None,
         }
     }
@@ -278,6 +296,7 @@ impl Hub {
     fn scope_key(&self) -> Option<String> {
         match self.current()? {
             Entry::Model(i) => self.ms.get(*i).map(|m| models::stem(&m.name)),
+            Entry::Profile(_, key) => Some(key.clone()),
             Entry::Pack(f, s) => Some(format!("{f}/{s}")),
             Entry::Add => None,
         }
@@ -619,7 +638,7 @@ impl Hub {
                 plan.total_weights_gb,
                 plan.kv_main_gb + plan.kv_draft_gb,
                 plan.overhead_gb,
-                e.kv_gb_per_token * 1024.0 * 1024.0,
+                e.kv_gb_per_token / 1024.0,
             ),
             ctx_max,
             verdict,
@@ -661,6 +680,31 @@ impl Hub {
                 self.reload();
             }
             Err(e) => self.msg = Some((format!("could not delete {name}: {e}"), true)),
+        }
+    }
+
+    /// Save the current entry's overrides (including pending edits) as a new
+    /// named profile attached to this model (`applies_to`), then persist.
+    /// Refuses empty names and keys that already exist.
+    fn save_as_profile(&mut self, name: String) {
+        if name.is_empty() {
+            self.msg = Some(("profile name is empty".into(), true));
+            return;
+        }
+        let Some(model) = self.current_model() else {
+            self.msg = Some(("choose a model first".into(), true));
+            return;
+        };
+        if settings::find_key(&self.work, &name).is_some() {
+            self.msg = Some((format!("profile '{name}' already exists"), true));
+            return;
+        }
+        let stem = models::stem(&model.name);
+        let mut prof = self.profile();
+        prof.applies_to = Some(stem);
+        self.work.model.insert(name.clone(), prof);
+        if self.save() {
+            self.msg = Some((format!("saved profile '{name}'"), false));
         }
     }
 
@@ -779,6 +823,26 @@ impl Hub {
             return Step::Continue;
         }
 
+        // Name input for "save as profile" consumes keys until Enter/Esc.
+        if let Overlay::SaveAs(edit) = &mut self.overlay {
+            match k.code {
+                KeyCode::Esc => self.overlay = Overlay::None,
+                KeyCode::Enter => {
+                    let name = edit.buf.trim().to_string();
+                    self.overlay = Overlay::None;
+                    self.save_as_profile(name);
+                }
+                KeyCode::Backspace => {
+                    edit.buf.pop();
+                }
+                KeyCode::Char(c) => {
+                    edit.buf.push(c);
+                }
+                _ => {}
+            }
+            return Step::Continue;
+        }
+
         if self.overlay != Overlay::None {
             self.overlay = Overlay::None;
             return Step::Continue;
@@ -803,6 +867,13 @@ impl Hub {
             }
             KeyCode::Char('s') => {
                 self.save();
+            }
+            KeyCode::Char('p') => {
+                if self.current_model().is_some() {
+                    self.overlay = Overlay::SaveAs(Edit { buf: String::new(), fresh: true });
+                } else {
+                    self.msg = Some(("choose a model first".into(), true));
+                }
             }
             KeyCode::Char('d') => self.build_argv(),
             KeyCode::Char('L') => {
@@ -898,6 +969,10 @@ impl Hub {
     fn launch_target(&self) -> Option<Launch> {
         match self.current()? {
             Entry::Model(i) => self.ms.get(*i).map(|m| Launch::Run(m.name.clone())),
+            Entry::Profile(i, key) => self
+                .ms
+                .get(*i)
+                .map(|m| Launch::Profile(key.clone(), m.name.clone())),
             Entry::Pack(f, s) => Some(Launch::Strata(f.clone(), s.clone())),
             Entry::Add => None,
         }
@@ -920,6 +995,9 @@ impl Hub {
                     leave();
                     let code = match target {
                         Launch::Run(name) => crate::cmd_run(&[name]),
+                        Launch::Profile(key, model) => {
+                            crate::cmd_run(&["--profile".into(), key, model])
+                        }
                         Launch::Strata(f, s) => crate::cmd_strata(&[f, s]),
                     };
                     enter();
@@ -949,6 +1027,8 @@ impl Hub {
             self.render_help(cols)
         } else if self.overlay == Overlay::Argv {
             self.render_argv(cols)
+        } else if let Overlay::SaveAs(e) = &self.overlay {
+            self.render_save_as(cols, &e.buf)
         } else if self.prompt.is_some() {
             self.render_prompt(cols)
         } else {
@@ -1007,6 +1087,7 @@ impl Hub {
                 .get(*i)
                 .map(|m| models::stem(&m.name))
                 .unwrap_or_else(|| "model".into()),
+            Some(Entry::Profile(_, key)) => format!("profile: {key}"),
             Some(Entry::Pack(f, s)) => format!("{f}/{s}"),
             Some(Entry::Add) => "add from HuggingFace".into(),
             None => "model".into(),
@@ -1038,6 +1119,7 @@ impl Hub {
         for (i, e) in self.entries.iter().enumerate() {
             let kind = match e {
                 Entry::Model(_) => 1u8,
+                Entry::Profile(..) => 1u8,
                 Entry::Pack(..) => 2u8,
                 Entry::Add => 3u8,
             };
@@ -1070,6 +1152,10 @@ impl Hub {
                     let text = crate::truncate(&m.name, width.saturating_sub(4));
                     format!(" {dot} {text}{DIM}{badge}{RESET}")
                 }
+                Entry::Profile(_, key) => {
+                    let text = crate::truncate(key, width.saturating_sub(7));
+                    format!("   {DIM}↳ {text}{RESET} {DIM}profile{RESET}")
+                }
                 Entry::Pack(f, s) => format!("   {DIM}{f}/{s}{RESET}"),
                 Entry::Add => format!(" {GREEN}+ add from HuggingFace{RESET}"),
             };
@@ -1092,7 +1178,7 @@ impl Hub {
     fn right_body(&self, width: usize, height: usize) -> Vec<String> {
         let mut header: Vec<String> = Vec::new();
         match self.current().cloned() {
-            Some(Entry::Model(i)) => {
+            Some(Entry::Model(i)) | Some(Entry::Profile(i, _)) => {
                 let m = &self.ms[i];
                 let kind = if m.moe { "MoE" } else { "dense" };
                 let mut traits = Vec::new();
@@ -1289,12 +1375,29 @@ impl Hub {
         } else {
             String::new()
         };
-        let keys = "↑↓ move · Tab panel · Enter edit · d argv · L run · s save · x delete · ? help · q quit";
+        let keys = "↑↓ move · Tab panel · Enter edit · d argv · p save as · L run · s save · x delete · ? help · q quit";
         pad(&format!("{DIM}{keys}{RESET}{dirty}"), cols)
     }
 
-    fn render_help(&self, cols: usize) -> String {
+    /// "Save as profile" overlay: a one-line name input.
+    fn render_save_as(&self, cols: usize, buf: &str) -> String {
         let body = vec![
+            String::new(),
+            "  Save the current overrides as a new named profile".to_string(),
+            format!("  attached to this model ({DIM}applies_to{RESET})."),
+            String::new(),
+            format!("  name: {CYAN}{buf}{RESET}{DIM}_{RESET}"),
+            String::new(),
+        ];
+        crate::boxed(
+            &format!("{CYAN}{BOLD}save as profile{RESET}"),
+            &body,
+            &format!("{DIM}Enter save · Esc cancel{RESET}"),
+            cols,
+        )
+    }
+
+    fn render_help(&self, cols: usize) -> String {        let body = vec![
             String::new(),
             crate::section("MODELS PANEL"),
             format!("  {GREEN}↑↓{RESET}      pick a model, pack or the add row"),
@@ -1310,6 +1413,7 @@ impl Hub {
             String::new(),
             crate::section("ANYWHERE"),
             format!("  {GREEN}s{RESET}       write changed keys to settings.toml"),
+            format!("  {GREEN}p{RESET}       save the current overrides as a named profile (asks for a name)"),
             format!("  {GREEN}d{RESET}       argv with the origin of every value"),
             format!("  {GREEN}?{RESET}       this help"),
             format!("  {GREEN}q{RESET}       quit (Esc also leaves the settings panel)"),
