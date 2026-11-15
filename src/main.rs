@@ -94,6 +94,8 @@ struct RunOpts {
     split_mode: Option<String>,
     /// per-card shares, e.g. "0.57,0.43"
     tensor_split: Option<String>,
+    /// explicit external draft file (.gguf); overrides built-in MTP too
+    draft_model: Option<String>,
     /// llama.cpp log level; 4 prints the memory breakdown
     log_verbosity: Option<u32>,
     /// enable multimodal vision input ("on" | "off")
@@ -169,6 +171,7 @@ impl Default for RunOpts {
             kv_ram: None,
             split_mode: None,
             tensor_split: None,
+            draft_model: None,
             log_verbosity: None,
             alias: None,
             repl: false,
@@ -230,6 +233,8 @@ struct Cfg {
     kv_ram: bool,
     split_mode: String,
     tensor_split: Option<String>,
+    /// explicit external draft file; set wins over the built-in MTP head
+    draft_model: Option<String>,
     log_verbosity: u32,
     /// multimodal vision input enabled
     vision: bool,
@@ -618,6 +623,7 @@ fn cmd_info(args: &[String]) -> i32 {
     let mut kv_ram: Option<bool> = None;
     let mut split_mode: Option<String> = None;
     let mut tensor_split: Option<String> = None;
+    let mut draft_model: Option<String> = None;
     let mut draft_ctk: Option<String> = None;
     let mut draft_ctv: Option<String> = None;
     let mut query: Vec<String> = Vec::new();
@@ -641,6 +647,7 @@ fn cmd_info(args: &[String]) -> i32 {
             "--kv-vram" => kv_ram = Some(false),
             "--split-mode" => split_mode = val(&mut i),
             "--tensor-split" => tensor_split = val(&mut i),
+            "--draft-model" => draft_model = val(&mut i),
             "--draft-ctk" => draft_ctk = Some(val(&mut i).unwrap_or_default()),
             "--draft-ctv" => draft_ctv = Some(val(&mut i).unwrap_or_default()),
             s if s.starts_with('-') => {}
@@ -666,11 +673,6 @@ fn cmd_info(args: &[String]) -> i32 {
             None => return 1,
         };
         let stem = models::stem(&model.name);
-        let draft = if model.nextn {
-            None
-        } else {
-            models::find_draft(&model.path)
-        };
         let saved = settings::load();
         let model_profile = saved.model.get(&stem);
         let mut o = RunOpts::default();
@@ -682,9 +684,11 @@ fn cmd_info(args: &[String]) -> i32 {
         o.kv_ram = kv_ram;
         o.split_mode = split_mode;
         o.tensor_split = tensor_split;
+        o.draft_model = draft_model;
         o.draft_ctk = draft_ctk;
         o.draft_ctv = draft_ctv;
         let (cfg, _) = Cfg::explain(&o, &saved.defaults, model_profile);
+        let draft = models::resolve_draft(&model.path, model.nextn, cfg.draft_model.as_deref());
         let alias = cfg.alias.clone().unwrap_or_else(|| stem.clone());
         let port = cfg.port.unwrap_or(8080);
         let logpath = dir.join(format!(".localmodel-{port}.log"));
@@ -1096,7 +1100,11 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             push(&mut a, f("min_p"), &p.to_string());
         }
         if let Some(d) = draft {
-            push(&mut a, "--spec-type", "draft-dflash");
+            // Explicit draft file: the profile's draft_model, or the
+            // auto-detected sibling. dflash (LiLiCorr) and MTP heads are
+            // told apart by the file name.
+            let is_mtp = d.to_string_lossy().to_lowercase().contains("mtp");
+            push(&mut a, "--spec-type", if is_mtp { "draft-mtp" } else { "draft-dflash" });
             push(&mut a, "--spec-draft-model", &d.display().to_string());
             push(&mut a, f("draft_gpu"), "999");
             push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
@@ -1112,17 +1120,20 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
         if let Some(p) = c.min_p {
             push(&mut a, f("min_p"), &p.to_string());
         }
-        if m.nextn {
+        if let Some(d) = draft {
+            // Explicit external draft (profile draft_model, or the
+            // auto-detected sibling): wins even over a built-in MTP head.
+            let is_mtp = d.to_string_lossy().to_lowercase().contains("mtp");
+            push(&mut a, "--spec-type", if is_mtp { "draft-mtp" } else { "draft-dflash" });
+            push(&mut a, "--spec-draft-model", &d.display().to_string());
+            push(&mut a, f("draft_gpu"), "999");
+            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
+        } else if m.nextn {
             // Built-in MTP head (blk.N.nextn.*): llama.cpp drafts from the
             // target model itself, so there is no --spec-draft-model to pass.
             // The nextn experts land where the CPU-MoE split puts them.
             push(&mut a, "--spec-type", "draft-mtp");
             push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(3).to_string());
-        } else if let Some(d) = draft {
-            push(&mut a, "--spec-type", "draft-dflash");
-            push(&mut a, "--spec-draft-model", &d.display().to_string());
-            push(&mut a, f("draft_gpu"), "999");
-            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
         }
     } else {
         push(&mut a, f("ngl"), &c.ngl.unwrap_or(99).to_string());
@@ -1138,28 +1149,19 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             push(&mut a, f("top_k"), &k.to_string());
         }
         push(&mut a, f("min_p"), &c.min_p.unwrap_or(0.0).to_string());
-        if m.nextn {
-            // Unsloth UD quants already contain the MTP head (blk.N.nextn.*).
-            // llama.cpp builds the draft context from the target model itself,
-            // so there is no --spec-draft-model, -ngl or -device to pass.
-            // n-max 3 measured 40-44 tok/s on a 4060 Ti 16 GB at 32K (n=1: ~30).
-            push(&mut a, "--spec-type", "draft-mtp");
-            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(3).to_string());
-        } else if let Some(d) = draft {
-            // External draft head (older models without a built-in MTP layer).
-            // Qwen3.8 MTP head on the CPU, the same split Strata does in
-            // hybrid mode. --spec-draft-device none is the important part:
-            // without it llama.cpp still reserves ~700 MiB of draft compute
-            // buffers on the GPU even with --spec-draft-ngl 0, which does not
-            // fit beside a 12+ GB model and 128K of KV.
+        if let Some(d) = draft {
+            // Explicit external draft (profile draft_model, or the
+            // auto-detected sibling): wins even over a built-in MTP head,
+            // so a UD quant can switch between its built-in MTP and a
+            // separate draft file.
+            // --spec-draft-device none matters for a CPU draft: without it
+            // llama.cpp still reserves ~700 MiB of draft compute buffers on
+            // the GPU even with --spec-draft-ngl 0.
             let is_mtp = d.to_string_lossy().to_lowercase().contains("mtp");
             let spec = if is_mtp { "draft-mtp" } else { "draft-dflash" };
             push(&mut a, "--spec-type", spec);
             push(&mut a, "--spec-draft-model", &d.display().to_string());
             if c.draft_gpu {
-                // Draft on the GPU: only fits with a small context (32-48K
-                // with q4 KV). Decode gains ~30% since the CPU draft no
-                // longer competes with prefill for threads.
                 push(&mut a, f("draft_gpu"), "999");
             } else {
                 push(&mut a, f("draft_gpu"), "0");
@@ -1170,6 +1172,13 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             // token per step is the sweet spot there.
             let n = c.draft_tokens.unwrap_or(if is_mtp { 1 } else { 7 });
             push(&mut a, f("draft_tokens"), &n.to_string());
+        } else if m.nextn {
+            // Unsloth UD quants already contain the MTP head (blk.N.nextn.*).
+            // llama.cpp builds the draft context from the target model itself,
+            // so there is no --spec-draft-model, -ngl or -device to pass.
+            // n-max 3 measured 40-44 tok/s on a 4060 Ti 16 GB at 32K (n=1: ~30).
+            push(&mut a, "--spec-type", "draft-mtp");
+            push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(3).to_string());
         }
     }
 
@@ -2023,6 +2032,7 @@ fn card_cfg(ctx: u32, ctk: &str, ctv: &str, draft_ctk: &str, draft_ctv: &str) ->
         kv_ram: false,
         split_mode: "layer".into(),
         tensor_split: None,
+        draft_model: None,
         log_verbosity: 4,
         vision: false,
         mmproj: None,
@@ -2160,16 +2170,20 @@ fn memory_lines(
 }
 
 fn gpu_lines() -> Vec<String> {
-    let gpus = server::gpu_infos();
+    let mut gpus = server::gpu_infos();
+    // Same order as the engine and the plan rows above: llama.cpp puts the
+    // biggest card in CUDA0, nvidia-smi lists PCI order. Labels are
+    // positional (GPU0 = the card ts shares apply to first).
+    gpus.sort_by(|a, b| b.mem_total.total_cmp(&a.mem_total));
     let mut b = vec![section("GPU")];
     if gpus.is_empty() {
         b.push(kv("Device", &format!("{DIM}n/a{RESET}")));
         return b;
     }
-    for g in &gpus {
+    for (pos, g) in gpus.iter().enumerate() {
         let pct = if g.mem_total > 0.0 { g.mem_used / g.mem_total * 100.0 } else { 0.0 };
         b.push(kv(
-            &format!("GPU{}", g.index),
+            &format!("GPU{pos}"),
             &format!("{}  {DIM}{:.0}% util · {:.0}°C · {:.0}/{:.0} W{RESET}", g.name, g.util, g.temp, g.power_draw, g.power_limit),
         ));
         b.push(kv(
@@ -2249,6 +2263,41 @@ fn placement_knob_lines(cfg: &Cfg) -> Vec<String> {
     v
 }
 
+/// Draft (exact file or built-in MTP head), vision, multi-GPU split and the
+/// CPU-MoE slice: the facts that decide how a launch actually behaves. Shared
+/// by the run card and `localmodel info` so both agree with the hub.
+fn launch_facts_lines(m: &Model, cfg: &Cfg, draft: Option<&Path>) -> Vec<String> {
+    let mut v = Vec::new();
+    if let Some(d) = draft {
+        let name = d
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| d.display().to_string());
+        let is_mtp = name.to_lowercase().contains("mtp");
+        let spec = if is_mtp { "draft-mtp" } else { "draft-dflash" };
+        let nmax = cfg.draft_tokens.unwrap_or(if is_mtp { 1 } else { 7 });
+        v.push(kv("Draft", &format!("{name}  {DIM}· {spec} · n-max {nmax}{RESET}")));
+    } else if m.nextn {
+        let nmax = cfg.draft_tokens.unwrap_or(3);
+        v.push(kv("Draft", &format!("built-in MTP head  {DIM}· draft-mtp · n-max {nmax}{RESET}")));
+    }
+    if cfg.vision {
+        let dev = if cfg.extra.as_deref().unwrap_or("").contains("--mmproj-device none") {
+            "CPU"
+        } else {
+            "GPU"
+        };
+        v.push(kv("Vision", &format!("on  {DIM}mmproj on {dev}{RESET}")));
+    }
+    if let Some(ts) = &cfg.tensor_split {
+        v.push(kv("Split", &format!("{}  {DIM}ts {ts}{RESET}", cfg.split_mode)));
+    }
+    if let Some(n) = cfg.ncmoe.filter(|n| *n > 0) {
+        v.push(kv("CPU experts", &format!("first {n} blocks  {DIM}--n-cpu-moe{RESET}")));
+    }
+    v
+}
+
 fn model_card(
     m: &Model,
     alias: &str,
@@ -2271,6 +2320,7 @@ fn model_card(
     if m.moe && m.experts_total > 0 {
         body.push(kv("Experts", &format!("{} total, {} active/token", m.experts_total, m.experts_active)));
     }
+    body.extend(launch_facts_lines(m, cfg, draft));
     body.push(String::new());
     body.extend(memory_lines(&plan, None, &hw, false));
     body.extend(placement_knob_lines(cfg));
@@ -2724,6 +2774,7 @@ fn render_info(
     if m.moe && m.experts_total > 0 {
         body.push(kv("Experts", &format!("{} total, {} active/token", m.experts_total, m.experts_active)));
     }
+    body.extend(launch_facts_lines(m, cfg, draft));
     body.push(String::new());
     body.extend(memory_lines(&plan, None, &hw, false));
     body.extend(placement_knob_lines(cfg));
@@ -2750,10 +2801,12 @@ fn stats_line(info: &Info, s: &Stats, m: &Model) -> String {
     let avg = fmt_opt(s.avg_dec());
     let pre = fmt_opt(s.last_pre);
     let layers = format!("{}/{}", m.layers, m.layers);
+    let (gpu, temp) = server::gpu_util_temp_max();
+    let temp_str = temp.map(|t| format!(" · {:.0}°C", t)).unwrap_or_default();
     let mut line = format!(
-        "{} ● {} :{} {}  ctx {}  kv {}/{}  layers {}  dec {}/s (avg {})  pre {}/s  vram {}  ram {}  req {}  gpu {}",
+        "{} ● {} :{} {}  ctx {}  kv {}/{}  layers {}  dec {}/s (avg {})  pre {}/s  vram {}  ram {}  req {}  gpu {}{}",
         dot, info.alias, info.port, state, ctx, info.ctk, info.ctv, layers, dec, avg, pre,
-        gpu_str(info.pid), ram_text(info.pid).short, s.reqs, server::gpu_util().unwrap_or(0.0)
+        gpu_str(info.pid), ram_text(info.pid).short, s.reqs, gpu.map(|g| g as i64).unwrap_or(0), temp_str
     );
     if m.moe && m.experts_total > 0 {
         line.push_str(&format!("  experts {}/{} active", m.experts_active, m.experts_total));
@@ -3061,6 +3114,7 @@ fn cmd_run(args: &[String]) -> i32 {
             "--kv-vram" => o.kv_ram = Some(false),
             "--split-mode" => o.split_mode = val(&mut i),
             "--tensor-split" => o.tensor_split = val(&mut i),
+            "--draft-model" => o.draft_model = val(&mut i),
             "--log-verbosity" | "-lv" => o.log_verbosity = val(&mut i).and_then(|v| v.parse().ok()),
             "--alias" => o.alias = val(&mut i),
             "--repl" => o.repl = true,
@@ -3156,7 +3210,7 @@ fn cmd_run(args: &[String]) -> i32 {
         );
     }
 
-    let draft = models::find_draft(&model.path);
+    let draft = models::resolve_draft(&model.path, model.nextn, cfg.draft_model.as_deref());
     let sv = build_args(&model, draft.as_deref(), &alias, port, &cfg);
 
     // `extra` is the one open-ended channel; check its flags against the
@@ -4191,6 +4245,7 @@ mod tests {
             kv_ram: false,
             split_mode: "layer".into(),
             tensor_split: None,
+            draft_model: None,
             log_verbosity: 4,
             vision: false,
             mmproj: None,

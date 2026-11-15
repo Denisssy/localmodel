@@ -427,7 +427,7 @@ profile_knobs! {
         , Kind::Text
         , Applies::All
         , "--tensor-split"
-        , "Per-card share, e.g. 0.57,0.43. Empty means an even split.";
+        , "Per-card share, e.g. 0.57,0.43. Empty means an even split. Cards are ordered by the engine (llama.cpp puts the bigger card first).";
     port : u16
         , "port"
         , Group::Server
@@ -519,6 +519,13 @@ profile_knobs! {
         , Applies::Draft
         , "--spec-draft-n-max"
         , "Tokens proposed per speculative step; 2-3 pays off for MTP.";
+    draft_model : String
+        , "draft model"
+        , Group::Speed
+        , Kind::Path
+        , Applies::Draft
+        , "--spec-draft-model"
+        , "External draft file (.gguf). Empty auto-detects the sibling (mtp-*/ *-LiLiCorr / draft-*). Setting it overrides even a built-in MTP head, so qwen-style models can switch between the two.";
     draft_gpu : bool
         , "draft on GPU"
         , Group::Speed

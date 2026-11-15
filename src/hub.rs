@@ -112,6 +112,8 @@ struct DraftInfo {
     weights: u64,
     ctk: String,
     ctv: String,
+    /// What the user sees: the draft file name, or "(built-in MTP head)".
+    name: String,
 }
 
 struct EstimateView {
@@ -461,7 +463,7 @@ impl Hub {
 
     fn draft_info(&mut self, m: &Model, cfg: &crate::Cfg) -> Option<DraftInfo> {
         let (dctk, dctv) = fit::draft_kv_types(cfg);
-        if m.nextn {
+        if m.nextn && cfg.draft_model.is_none() {
             return Some(DraftInfo {
                 meta: m.meta.clone(),
                 layers: m.meta.kv.draft.clone(),
@@ -469,9 +471,15 @@ impl Hub {
                 weights: 0,
                 ctk: dctk,
                 ctv: dctv,
+                name: "(built-in MTP head)".to_string(),
             });
         }
-        let path = models::find_draft(&m.path)?;
+        // An explicit draft_model overrides even the built-in head.
+        let path = models::resolve_draft(&m.path, m.nextn, cfg.draft_model.as_deref())?;
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.display().to_string());
         let (meta, bytes) = match self.draft_cache.get(&path).cloned() {
             Some(x) => x,
             None => {
@@ -488,6 +496,7 @@ impl Hub {
             weights: bytes,
             ctk: dctk,
             ctv: dctv,
+            name,
         })
     }
 
@@ -507,15 +516,13 @@ impl Hub {
             ctv: &d.ctv,
         });
         let e = fit::for_gguf(&m.meta, m.size, &self.hw, cfg.ctx, &cfg.ctk, &cfg.ctv, dref, cfg.kv_ram);
-        // The hub plans with the same code the running card uses. The built-in
-        // MTP head is already inside `m`, so only an external draft is passed.
-        let plan_draft = if m.nextn {
-            None
-        } else {
-            draft
-                .as_ref()
-                .map(|d| mem::Draft { meta: &d.meta, weights: d.weights })
-        };
+        // The hub plans with the same code the running card uses. `draft`
+        // is the external file actually used (explicit draft_model, or the
+        // auto-detected sibling); a built-in MTP head lives inside `m`.
+        let plan_draft = draft
+            .as_ref()
+            .filter(|d| d.weights > 0)
+            .map(|d| mem::Draft { meta: &d.meta, weights: d.weights });
         // `fit` answers "does the whole model fit"; for a MoE with experts
         // kept in RAM the answer is misleadingly "no". Use the actual
         // placement for the verdict, the header numbers and the context cap.
@@ -545,6 +552,18 @@ impl Hub {
             "{DIM}offload{RESET}  -ngl {}/{} blocks · --n-cpu-moe {}",
             plan.ngl, plan.block_count, plan.ncmoe
         ));
+        if let Some(d) = &draft {
+            let spec = if d.name.to_lowercase().contains("mtp") {
+                "draft-mtp"
+            } else {
+                "draft-dflash"
+            };
+            let nmax = cfg.draft_tokens.unwrap_or(if spec == "draft-mtp" { 3 } else { 7 });
+            mem.push(format!(
+                "{DIM}draft{RESET}   {}  {DIM}· {} · n-max {}{RESET}",
+                d.name, spec, nmax
+            ));
+        }
         if let Some(v) = &cfg.load_mode {
             let note = match v.as_str() {
                 "none" => "weights in anonymous RAM, no SSD paging",
@@ -655,7 +674,7 @@ impl Hub {
                     .clone()
                     .unwrap_or_else(|| models::stem(&m.name));
                 let port = cfg.port.unwrap_or_else(|| crate::server::free_port(8080));
-                let draft = models::find_draft(&m.path);
+                let draft = models::resolve_draft(&m.path, m.nextn, cfg.draft_model.as_deref());
                 let args = crate::build_args(&m, draft.as_deref(), &alias, port, &cfg);
                 let bin = config::server_bin();
                 let mut lines = Vec::new();

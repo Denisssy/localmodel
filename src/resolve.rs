@@ -279,6 +279,12 @@ impl crate::Cfg {
             defaults.tensor_split.clone(),
             None,
         );
+        let (draft_model, draft_model_src) = pick(
+            o.draft_model.clone(),
+            model.and_then(|p| p.draft_model.clone()),
+            defaults.draft_model.clone(),
+            None,
+        );
         let (log_verbosity, log_verbosity_src) = pick(
             o.log_verbosity,
             model.and_then(|p| p.log_verbosity),
@@ -475,6 +481,9 @@ impl crate::Cfg {
         if let Some(ref v) = tensor_split {
             origins.push(Origin::new("tensor_split", v.clone(), tensor_split_src));
         }
+        if let Some(ref v) = draft_model {
+            origins.push(Origin::new("draft_model", v.clone(), draft_model_src));
+        }
         origins.push(Origin::new(
             "log_verbosity",
             log_verbosity.to_string(),
@@ -565,6 +574,7 @@ impl crate::Cfg {
             kv_ram,
             split_mode,
             tensor_split,
+            draft_model,
             log_verbosity,
             vision,
             mmproj,

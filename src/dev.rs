@@ -722,7 +722,7 @@ fn window_start(len: usize, cursor: usize, avail: usize) -> usize {
             return false;
         }
         let Some(model) = self.ms.get(self.sel).cloned() else { return false; };
-        let draft = models::find_draft(&model.path);
+        let draft = models::resolve_draft(&model.path, model.nextn, self.cfg.draft_model.as_deref());
         let sv = crate::build_args(&model, draft.as_deref(), &self.alias, self.port, &self.cfg);
         let mut child = match Command::new(&self.bin).args(&sv).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn() {
             Ok(c) => c,

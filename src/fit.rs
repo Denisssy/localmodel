@@ -378,10 +378,16 @@ impl Hardware {
             ),
             None => (0.0, 0.0),
         };
-        let gpus: Vec<(String, f64)> = server::gpu_infos()
+        // llama.cpp orders its CUDA devices with the biggest card first
+        // (observed: 16 GB 4060 Ti = CUDA0, 12 GB 3060 = CUDA1), while
+        // nvidia-smi lists them in PCI order. tensor-split shares apply to
+        // the engine's order, so sort here to keep the per-device plan rows
+        // (hub, run card) pointing at the same card the engine will use.
+        let mut gpus: Vec<(String, f64)> = server::gpu_infos()
             .into_iter()
             .map(|g| (g.name, g.mem_total / 1024.0))
             .collect();
+        gpus.sort_by(|a, b| b.1.total_cmp(&a.1));
         let vram_total_gb = if gpus.is_empty() {
             match server::gpu_mem() {
                 Some((_used, total)) => total / 1024.0,

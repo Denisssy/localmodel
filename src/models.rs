@@ -136,6 +136,23 @@ pub fn find_draft(model: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The draft file a model will actually use. An explicit `draft_model`
+/// profile path always wins - even over a built-in MTP head, so qwen-style
+/// models can switch between the two. Otherwise a model with a built-in MTP
+/// head (`nextn`) drafts from itself (no file), and the rest auto-detect the
+/// sibling draft (`mtp-*`, `*-LiLiCorr`, `draft-*`).
+pub fn resolve_draft(model: &Path, nextn: bool, configured: Option<&str>) -> Option<PathBuf> {
+    if let Some(s) = configured.map(str::trim) {
+        if !s.is_empty() && s != "-" {
+            return Some(PathBuf::from(s));
+        }
+    }
+    if nextn {
+        return None;
+    }
+    find_draft(model)
+}
+
 /// The vision projector that sits next to `model`, if any.
 ///
 /// Unsloth and llama.cpp repos name these `mmproj-<base>-<quant>.gguf` or

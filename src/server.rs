@@ -89,6 +89,32 @@ pub fn gpu_util() -> Option<f64> {
     s.lines().next()?.trim().parse::<f64>().ok()
 }
 
+/// (max util %, max temp °C) across all cards. The dashboard line is one
+/// short string, so the busy/hot card wins; per-card details live in the
+/// card's GPU section.
+pub fn gpu_util_temp_max() -> (Option<f64>, Option<f64>) {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        .ok();
+    let Some(out) = out else { return (None, None) };
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut util = None;
+    let mut temp = None;
+    for l in s.lines() {
+        let mut parts = l.split(',').map(|p| p.trim().parse::<f64>());
+        let u = parts.next().and_then(Result::ok);
+        let t = parts.next().and_then(Result::ok);
+        if u.is_some() && u > util {
+            util = u;
+        }
+        if t.is_some() && t > temp {
+            temp = t;
+        }
+    }
+    (util, temp)
+}
+
 pub fn gpu_mem() -> Option<(f64, f64)> {
     let out = Command::new("nvidia-smi")
         .args(["--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"])
