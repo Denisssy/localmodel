@@ -15,6 +15,13 @@ pub struct TemplateCaps {
     pub effort_values: Vec<String>,
     pub has_medium_effort: bool,
     pub has_enable_thinking: bool,
+    /// The template reads `reasoning_effort` (Qwen style).
+    pub has_reasoning_effort: bool,
+    /// The template reads `reasoning_strength` (Muse style). llama.cpp
+    /// mirrors REQUEST-level reasoning_effort into it, but server-default
+    /// `--chat-template-kwargs` are applied verbatim - the default must use
+    /// this exact name or the model never sees it.
+    pub has_reasoning_strength: bool,
 }
 
 pub fn caps_from_template(t: &str) -> TemplateCaps {
@@ -39,6 +46,8 @@ pub fn caps_from_template(t: &str) -> TemplateCaps {
         effort_values: values,
         has_medium_effort: t.contains("medium_effort"),
         has_enable_thinking: t.contains("enable_thinking"),
+        has_reasoning_effort: t.contains("reasoning_effort"),
+        has_reasoning_strength: t.contains("reasoning_strength"),
     }
 }
 
@@ -58,20 +67,39 @@ pub fn effort_kwargs(caps: &TemplateCaps, effort: Option<&str>) -> Option<Value>
             _ => json!({ "enable_thinking": true }),
         });
     }
-    if caps.effort_values.is_empty() {
-        return None;
+    if caps.has_reasoning_effort {
+        // Qwen-style. 'off' binds to enable_thinking when present.
+        if e == "off" || e == "none" {
+            return caps.has_enable_thinking.then(|| json!({ "enable_thinking": false }));
+        }
+        if caps.effort_values.is_empty() {
+            return None;
+        }
+        let chosen = if caps.effort_values.iter().any(|v| *v == e) {
+            e
+        } else if e == "high" && caps.effort_values.iter().any(|v| v == "xhigh") {
+            // qwen has no separate 'high': the template itself repprofiles
+            // high to xhigh, so either spelling lands on the same render
+            "xhigh".to_string()
+        } else {
+            return None; // unsupported level: keep the template default
+        };
+        return Some(json!({ "reasoning_effort": chosen }));
     }
+    if caps.has_reasoning_strength {
+        // Muse/Glimmer-style: strength goes into the system prompt; there is
+        // no way to switch thinking off. Any canonical level is accepted
+        // (the template compares the string and defaults to 'high').
+        if e == "off" || e == "none" {
+            return None;
+        }
+        return Some(json!({ "reasoning_strength": e }));
+    }
+    // enable_thinking-only templates (Ornith): only on/off.
     if e == "off" || e == "none" {
         return caps.has_enable_thinking.then(|| json!({ "enable_thinking": false }));
     }
-    let chosen = if caps.effort_values.iter().any(|v| *v == e) {
-        e
-    } else if e == "high" && caps.effort_values.iter().any(|v| v == "xhigh") {
-        "xhigh".to_string()
-    } else {
-        return None; // unsupported level: keep the template default
-    };
-    Some(json!({ "reasoning_effort": chosen }))
+    None
 }
 
 /// Minimal GGUF header reader lives in `gguf.rs`; this turns the template
@@ -136,6 +164,47 @@ mod tests {
             effort_kwargs(&caps, Some("off")),
             Some(json!({ "enable_thinking": false }))
         );
+    }
+
+    #[test]
+    fn enable_thinking_only_template_binds_off() {
+        // Ornith-style: no reasoning_effort literals, only the bool switch.
+        const ORNITH: &str = "{%- if enable_thinking is defined and enable_thinking is false %}<|im_start|>user\n{%- endif %}";
+        let caps = caps_from_template(ORNITH);
+        assert!(caps.effort_values.is_empty());
+        assert!(caps.has_enable_thinking);
+        assert!(!caps.has_medium_effort);
+        // the regression: 'off' must still reach enable_thinking
+        assert_eq!(
+            effort_kwargs(&caps, Some("off")),
+            Some(json!({ "enable_thinking": false }))
+        );
+        assert_eq!(effort_kwargs(&caps, Some("medium")), None);
+        assert_eq!(effort_kwargs(&caps, None), None);
+    }
+
+    #[test]
+    fn glimmer_strength_knob_uses_its_own_name() {
+        // Muse template reads `reasoning_strength`, default 'high'; no
+        // reasoning_effort anywhere. Server-default kwargs are verbatim, so
+        // the kwarg must be named reasoning_strength or the model never
+        // sees it (request-level reasoning_effort is mirrored by llama.cpp).
+        const GLIMMER: &str = "{%- set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength else 'high' -%}\n{{ rs }}";
+        let caps = caps_from_template(GLIMMER);
+        assert!(!caps.has_reasoning_effort);
+        assert!(caps.has_reasoning_strength);
+        assert!(!caps.has_enable_thinking);
+        assert_eq!(
+            effort_kwargs(&caps, Some("medium")),
+            Some(json!({ "reasoning_strength": "medium" }))
+        );
+        assert_eq!(
+            effort_kwargs(&caps, Some("xhigh")),
+            Some(json!({ "reasoning_strength": "xhigh" }))
+        );
+        // no way to switch thinking off on this template
+        assert_eq!(effort_kwargs(&caps, Some("off")), None);
+        assert_eq!(effort_kwargs(&caps, None), None);
     }
 
     #[test]

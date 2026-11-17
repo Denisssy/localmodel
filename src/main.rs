@@ -1921,6 +1921,23 @@ fn props_ctx(port: u16) -> Option<u64> {
     v.get("default_generation_settings")?.get("n_ctx")?.as_u64()
 }
 
+/// Reasoning effort levels the RUNNING server's template renders distinctly
+/// (`chat_template_caps.reasoning_effort_levels` from /props). Authoritative:
+/// llama.cpp probes by rendering the template per candidate level and
+/// collapses aliases (qwen's 'high' renders as 'xhigh' and is dropped).
+fn props_reasoning_levels(port: u16) -> Option<Vec<String>> {
+    let s = curl_get(&format!("http://127.0.0.1:{port}/props"))?;
+    let v: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let levels: Vec<String> = v
+        .get("chat_template_caps")?
+        .get("reasoning_effort_levels")?
+        .as_array()?
+        .iter()
+        .filter_map(|x| x.as_str().map(str::to_string))
+        .collect();
+    Some(levels)
+}
+
 fn chat(port: u16, alias: &str, text: &str, images: Option<&[String]>, template_kwargs: Option<&Value>) -> Option<String> {
     let content = match images {
         Some(imgs) if !imgs.is_empty() => {
@@ -2176,6 +2193,130 @@ fn memory_lines(
     b
 }
 
+/// REASONING block: every thinking level the RUNNING model's template can
+/// render, with the active one (the server-side default the launcher bound)
+/// in bold green. Levels come from the server's /props capability probe when
+/// it is up (render-based, aliases collapsed) and fall back to scanning the
+/// GGUF chat template. 'none' appears when the template can switch thinking
+/// off; 'high' collapses into 'xhigh' (the templates repprofile high to
+/// xhigh themselves). Models whose template has no knob render a single
+/// always-on row - there the harness cannot set thinking at all. The last
+/// request's effective effort (from the chat-reasoning-effort-log llama.cpp
+/// patch) shows in yellow when it differed from the active default.
+fn reasoning_lines(
+    m: &Model,
+    cfg: &Cfg,
+    live: Option<&telemetry::LoadInfo>,
+    props_levels: Option<Vec<String>>,
+) -> Vec<String> {
+    let caps = jinja::caps_for_model(&m.path);
+    let requested = cfg
+        .effort
+        .clone()
+        .or_else(|| caps.as_ref().and_then(|c| default_effort(c)));
+    let applied = caps
+        .as_ref()
+        .zip(requested.as_ref())
+        .and_then(|(c, e)| jinja::effort_kwargs(c, Some(e)));
+
+    const ORDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+    let mut levels: Vec<String> = vec![];
+    // The /props probe collapses aliases, so use its list verbatim when
+    // available (non-empty); an empty one means "no distinct levels" and
+    // falls through to the GGUF scan for enable_thinking-style models.
+    if let Some(lvls) = props_levels.filter(|v| !v.is_empty()) {
+        levels.extend(lvls);
+        // qwen-style templates gate thinking via enable_thinking too
+        if caps.as_ref().map(|c| c.has_enable_thinking).unwrap_or(true) {
+            levels.insert(0, "none".into());
+        }
+    }
+    if levels.is_empty() {
+        // 'none' only exists where thinking can actually be switched off.
+        if caps
+            .as_ref()
+            .map(|c| c.has_enable_thinking || c.has_reasoning_effort)
+            .unwrap_or(false)
+        {
+            levels.push("none".into());
+        }
+        if let Some(c) = caps.as_ref() {
+            // reasoning_strength templates (Glimmer) compare the raw string;
+            // the static scan cannot see which levels exist, offer the
+            // canonical set - the live server replaces this with the probed
+            // list from /props.
+            if c.has_reasoning_strength && c.effort_values.is_empty() {
+                levels.extend(ORDER.iter().map(|l| l.to_string()));
+            }
+            for l in ORDER {
+                // 'high' is a repprofile alias when 'xhigh' exists (qwen);
+                // glimmer's strength knob renders high and xhigh distinctly.
+                if c.effort_values.iter().any(|v| v == l)
+                    && !(l == "high" && c.has_reasoning_effort && c.effort_values.iter().any(|v| v == "xhigh"))
+                {
+                    levels.push(l.into());
+                }
+            }
+            // enable_thinking-only templates (Ornith): thinking-on is a state too
+            if c.has_enable_thinking && c.effort_values.is_empty() {
+                levels.push("on".into());
+            }
+        }
+    }
+
+    if levels.is_empty() {
+        return vec![
+            section("REASONING"),
+            kv(
+                "reasoning",
+                &format!("{YELLOW}always-on - no knob, harness cannot set thinking{RESET}"),
+            ),
+        ];
+    }
+
+    // Active = what the launcher passed (top level = template default thinks).
+    let active: Option<String> = match &applied {
+        Some(v) if v.get("enable_thinking") == Some(&json!(false)) => Some("none".into()),
+        Some(v) => v
+            .get("reasoning_effort")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.get("reasoning_strength").and_then(|x| x.as_str()))
+            .map(str::to_string)
+            .or_else(|| {
+                if v.get("medium_effort") == Some(&json!(true)) {
+                    Some("medium".into())
+                } else {
+                    None
+                }
+            })
+            .or_else(|| levels.last().cloned()),
+        None => levels.last().cloned(),
+    };
+
+    let line = levels
+        .iter()
+        .map(|l| {
+            if active.as_ref() == Some(l) {
+                format!("{GREEN}{BOLD}{l}{RESET}")
+            } else {
+                format!("{DIM}{l}{RESET}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut b = vec![section("REASONING"), kv("reasoning", &line)];
+    if let Some((v, src)) = live.and_then(|l| l.reasoning_effort.as_ref()) {
+        let differs = !v.is_empty() && active.as_deref() != Some(v.as_str());
+        let style = if differs { YELLOW } else { DIM };
+        if v.is_empty() {
+            b.push(kv("last", &format!("{style}({src}){RESET}")));
+        } else {
+            b.push(kv("last", &format!("{style}'{v}' ({src}){RESET}")));
+        }
+    }
+    b
+}
+
 fn gpu_lines() -> Vec<String> {
     let mut gpus = server::gpu_infos();
     // Same order as the engine and the plan rows above: llama.cpp puts the
@@ -2331,6 +2472,8 @@ fn model_card(
     body.push(String::new());
     body.extend(memory_lines(&plan, None, &hw, false));
     body.extend(placement_knob_lines(cfg));
+    let live = telemetry::read(logpath);
+    body.extend(reasoning_lines(m, cfg, live.as_ref(), None));
     body.push(String::new());
     body.extend(gpu_lines());
     body.push(String::new());
@@ -2634,7 +2777,14 @@ fn render_screen(
     // Progressive fit: full card, then compact sections, then fewer sections.
     // Never let the terminal scroll or cut a row in half.
     let budget = rows.saturating_sub(4); // two borders + two footer lines
-    let full = vec![model_full, memory_full, gpu_full, live_full, server_group.clone()];
+    let reasoning_full = {
+        // /props is authoritative once the server answers (render-probed
+        // levels, aliases collapsed); GGUF scan is the offline fallback.
+        let mut g = reasoning_lines(m, cfg, live, props_reasoning_levels(info.port));
+        g.push(String::new());
+        g
+    };
+    let full = vec![model_full, memory_full, reasoning_full, gpu_full, live_full, server_group.clone()];
     let compact = vec![
         model_short,
         memory_short.clone(),
@@ -2785,6 +2935,8 @@ fn render_info(
     body.push(String::new());
     body.extend(memory_lines(&plan, None, &hw, false));
     body.extend(placement_knob_lines(cfg));
+    let live = telemetry::read(logpath);
+    body.extend(reasoning_lines(m, cfg, live.as_ref(), None));
     body.push(String::new());
     body.extend(gpu_lines());
     body.push(String::new());

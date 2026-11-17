@@ -72,6 +72,10 @@ pub struct LoadInfo {
     /// while mmap is enabled. The CPU weights are then file-backed pages and
     /// get re-read from disk on every expert lookup.
     pub mmap_cpu_experts: bool,
+    /// Last chat request's effective reasoning effort: `(value, source)`
+    /// where source is `request`, `default` or `template`. Parsed from the
+    /// chat-reasoning-effort-log llama.cpp patch; None on stock builds.
+    pub reasoning_effort: Option<(String, String)>,
 }
 
 impl LoadInfo {
@@ -230,6 +234,25 @@ pub fn parse(text: &str) -> LoadInfo {
     for line in text.lines() {
         if line.contains("tensor overrides to CPU are used with mmap enabled") {
             info.mmap_cpu_experts = true;
+        }
+        // chat-reasoning-effort-log patch: "chat: reasoning_effort = 'X' (request|default)"
+        // or "chat: reasoning_effort = (template default)".
+        if let Some(rest) = line.split("chat: reasoning_effort = ").nth(1) {
+            let rest = rest.trim();
+            if let Some(inner) = rest.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
+                info.reasoning_effort = Some((String::new(), inner.to_string()));
+            } else {
+                let mut parts = rest.split(" (");
+                // server-default kwargs arrive json-dumped ("medium"),
+                // request values single-quoted ('xhigh') - normalize both
+                let value = parts
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(|c| c == '\'' || c == '"')
+                    .to_string();
+                let source = parts.next().map(|s| s.trim_end_matches(')')).unwrap_or("").to_string();
+                info.reasoning_effort = Some((value, source));
+            }
         }
         if line.contains("getting device memory data for the extra model")
             || line.contains("common_speculative_init_result: loading draft model")
@@ -444,6 +467,24 @@ mod tests {
         let rows = i.rows();
         let host = rows.iter().find(|(l, _)| l.starts_with("Host")).expect("host row");
         assert_eq!(host.0, "Host (mmap)");
+    }
+
+    #[test]
+    fn reasoning_effort_log_lines_are_parsed() {
+        let text = "\
+1.0.0 I chat: reasoning_effort = 'medium' (default)
+2.0.0 I chat: reasoning_effort = 'high' (request)
+3.0.0 I chat: reasoning_effort = (template default)
+4.0.0 I chat: reasoning_effort = 'xhigh' (request)
+";
+        let i = parse(text);
+        assert_eq!(
+            i.reasoning_effort.as_ref().map(|(v, s)| (v.as_str(), s.as_str())),
+            Some(("xhigh", "request")),
+            "last request wins"
+        );
+        let i2 = parse("9.9 I chat: reasoning_effort = (template default)\n");
+        assert_eq!(i2.reasoning_effort, Some((String::new(), "template default".into())));
     }
 
     #[test]
