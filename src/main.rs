@@ -2202,7 +2202,10 @@ fn memory_lines(
 /// xhigh themselves). Models whose template has no knob render a single
 /// always-on row - there the harness cannot set thinking at all. The last
 /// request's effective effort (from the chat-reasoning-effort-log llama.cpp
-/// patch) shows in yellow when it differed from the active default.
+/// patch) is shown as provenance under the list. The active highlight
+/// follows the LAST request's effective effort: harnesses override per
+/// request, so after a '#max' request from opencode 'max' is green until a
+/// request without effort falls back to the server default.
 fn reasoning_lines(
     m: &Model,
     cfg: &Cfg,
@@ -2274,8 +2277,11 @@ fn reasoning_lines(
         ];
     }
 
-    // Active = what the launcher passed (top level = template default thinks).
-    let active: Option<String> = match &applied {
+    // Active = what the model actually ran with last: the last request's
+    // effective effort when one is logged (harnesses override per request),
+    // falling back to the launcher-bound server default (top level of the
+    // list = template default thinks).
+    let applied_active: Option<String> = match &applied {
         Some(v) if v.get("enable_thinking") == Some(&json!(false)) => Some("none".into()),
         Some(v) => v
             .get("reasoning_effort")
@@ -2292,6 +2298,10 @@ fn reasoning_lines(
             .or_else(|| levels.last().cloned()),
         None => levels.last().cloned(),
     };
+    let active = match live.and_then(|l| l.reasoning_effort.as_ref()) {
+        Some((v, _)) if !v.is_empty() => Some(v.clone()),
+        _ => applied_active,
+    };
 
     let line = levels
         .iter()
@@ -2305,13 +2315,13 @@ fn reasoning_lines(
         .collect::<Vec<_>>()
         .join(", ");
     let mut b = vec![section("REASONING"), kv("reasoning", &line)];
+    // provenance for the highlighted value: where the last request's effort
+    // came from (request override vs server default vs template)
     if let Some((v, src)) = live.and_then(|l| l.reasoning_effort.as_ref()) {
-        let differs = !v.is_empty() && active.as_deref() != Some(v.as_str());
-        let style = if differs { YELLOW } else { DIM };
         if v.is_empty() {
-            b.push(kv("last", &format!("{style}({src}){RESET}")));
+            b.push(kv("last", &format!("{DIM}({src}){RESET}")));
         } else {
-            b.push(kv("last", &format!("{style}'{v}' ({src}){RESET}")));
+            b.push(kv("last", &format!("{DIM}'{v}' ({src}){RESET}")));
         }
     }
     b
