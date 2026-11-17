@@ -144,8 +144,13 @@ impl LoadInfo {
 }
 
 /// `CUDA0 (RTX 4060 Ti)` → `GPU0`, so live rows line up with the plan.
+/// llama.cpp v1.0 tensor-split loads report the sharded weights on a combined
+/// device `Meta()` (both cards as one allocation unit) - label it as such.
 fn device_label(name: &str) -> String {
     let head = name.split_whitespace().next().unwrap_or(name);
+    if head == "Meta()" {
+        return "GPU (split)".into();
+    }
     match head.strip_prefix("CUDA") {
         Some(n) => format!("GPU{n}"),
         None => head.to_string(),
@@ -220,21 +225,32 @@ fn parse_breakdown_line(line: &str) -> Option<(String, f64, f64, f64)> {
 pub fn parse(text: &str) -> LoadInfo {
     let mut info = LoadInfo::default();
     let mut target = 0u8; // 0 = main, 1 = draft
+    let mut draft_ready = false; // speculative context initialized
 
     for line in text.lines() {
         if line.contains("tensor overrides to CPU are used with mmap enabled") {
             info.mmap_cpu_experts = true;
         }
-        if line.contains("getting device memory data for the extra model") {
+        if line.contains("getting device memory data for the extra model")
+            || line.contains("common_speculative_init_result: loading draft model")
+        {
             target = 1;
         }
+        if line.contains("speculative decoding context initialized") {
+            draft_ready = true;
+        }
         if line.contains("offloaded ") && line.contains(" layers to GPU") {
-            let t = line.split("offloaded ").nth(1).unwrap_or("");
-            if let Some((a, b)) = t.split_once('/') {
-                let a = a.trim().parse().ok();
-                let b = b.split_whitespace().next().and_then(|x| x.parse().ok());
-                if let (Some(a), Some(b)) = (a, b) {
-                    info.offloaded = Some((a, b));
+            // The target model's load_tensors line comes first (real logs),
+            // but some builds print it after the draft's memory section, so
+            // first-seen wins instead of filtering by section.
+            if info.offloaded.is_none() {
+                let t = line.split("offloaded ").nth(1).unwrap_or("");
+                if let Some((a, b)) = t.split_once('/') {
+                    let a = a.trim().parse().ok();
+                    let b = b.split_whitespace().next().and_then(|x| x.parse().ok());
+                    if let (Some(a), Some(b)) = (a, b) {
+                        info.offloaded = Some((a, b));
+                    }
                 }
             }
         }
@@ -307,9 +323,16 @@ pub fn parse(text: &str) -> LoadInfo {
             }
         } else if let Some(v) = mib_after(line, "compute buffer size =") {
             let Some(dev) = device_before(line, "compute buffer size") else { continue };
-            let sec = if target == 1 { &mut info.draft } else { &mut info.main };
-            if dev.contains("CPU") || dev.starts_with("Host") {
-                sec.host_compute += v;
+            // sched_reserve re-reserves at runtime (after graph capture); the
+            // last print per device is the live buffer. Post-init re-reserves
+            // belong to the target context even though the draft section is
+            // still "current" in the log order.
+            let replace = line.contains("sched_reserve:");
+            let sec = if draft_ready || target == 0 { &mut info.main } else { &mut info.draft };
+            if dev.contains("CPU") || dev.starts_with("Host") || dev == "CUDA_Host" {
+                if replace { sec.host_compute = v; } else { sec.host_compute += v; }
+            } else if replace {
+                sec.dev(dev).compute = v;
             } else {
                 sec.dev(dev).compute += v;
             }
@@ -421,5 +444,49 @@ mod tests {
         let rows = i.rows();
         let host = rows.iter().find(|(l, _)| l.starts_with("Host")).expect("host row");
         assert_eq!(host.0, "Host (mmap)");
+    }
+
+    #[test]
+    fn v1_tensor_split_reports_meta_device_and_repeated_reserve() {
+        // llama.cpp v1.0 tensor-split: sharded weights land on the combined
+        // "Meta()" device, pinned staging on "CUDA_Host", and sched_reserve
+        // re-prints after graph capture - those repeats must replace, not add.
+        let text = "\
+0.01.469.312 I load_tensors: offloaded 53/53 layers to GPU
+0.01.469.320 I load_tensors:   CPU_Mapped model buffer size =   721.42 MiB
+0.01.469.321 I load_tensors:       Meta() model buffer size =  7207.05 MiB
+0.05.542.369 I llama_kv_cache:     Meta() KV buffer size =   832.00 MiB
+0.05.543.688 I llama_kv_cache:     Meta() KV buffer size =    48.75 MiB
+0.05.640.172 I sched_reserve:     Meta() compute buffer size =   299.52 MiB
+0.05.640.176 I sched_reserve:  CUDA_Host compute buffer size =   182.53 MiB
+0.05.745.531 I common_speculative_init_result: loading draft model '/models/dflash-Muse-Glimmer-30B-kquant.gguf'
+0.06.091.872 I load_tensors: offloaded 6/6 layers to GPU
+0.06.091.876 I load_tensors:       Meta() model buffer size =   831.16 MiB
+0.06.584.436 I llama_kv_cache:     Meta() KV buffer size =    13.28 MiB
+0.06.593.737 I sched_reserve:     Meta() compute buffer size =   407.62 MiB
+0.06.593.739 I sched_reserve:  CUDA_Host compute buffer size =    15.51 MiB
+0.06.889.403 I mtmd_context:      CUDA0 compute buffer size =   229.27 MiB
+0.06.954.707 I srv    load_model: speculative decoding context initialized
+1.32.607.275 I sched_reserve:     Meta() compute buffer size =   351.53 MiB
+1.32.607.279 I sched_reserve:  CUDA_Host compute buffer size =   182.53 MiB
+";
+        let i = parse(text);
+        assert_eq!(i.offloaded, Some((53, 53)), "draft's 6/6 must not win");
+        let m = i.main.devices.get("Meta()").expect("main Meta device");
+        assert!((m.model - 7207.05).abs() < 0.01);
+        // non-SWA + SWA caches are both live and add up
+        assert!((m.context - 880.75).abs() < 0.01, "{}", m.context);
+        // last sched_reserve wins (299.52 -> 351.53), mtmd CUDA0 is separate
+        assert!((m.compute - 351.53).abs() < 0.01, "{}", m.compute);
+        assert!((i.main.host_model - 721.42).abs() < 0.01);
+        // CUDA_Host is pinned host memory, counted as host overhead
+        assert!((i.main.host_compute - 182.53).abs() < 0.01, "{}", i.main.host_compute);
+        assert!(i.main.devices.get("CUDA_Host").is_none());
+        let d = i.draft.devices.get("Meta()").expect("draft Meta device");
+        assert!((d.model - 831.16).abs() < 0.01);
+        assert!((d.compute - 407.62).abs() < 0.01);
+        let rows = i.rows();
+        let split = rows.iter().find(|(l, _)| l == "GPU (split)").expect("split row");
+        assert!(split.1.contains("weights 7.04"), "{}", split.1);
     }
 }
