@@ -125,7 +125,7 @@ pub fn find_draft(model: &Path) -> Option<PathBuf> {
         let Some(name) = p.file_name().map(|s| s.to_string_lossy().to_lowercase()) else {
             continue;
         };
-        if !name.contains("lilicorr") && !name.contains("draft") && !name.contains("mtp-") {
+        if !name.contains("lilicorr") && !name.contains("dflash") && !name.contains("draft") && !name.contains("mtp-") {
             continue;
         }
         let dstem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
@@ -241,5 +241,22 @@ mod tests {
         // Active-param notation flags MoE; the total is unknown unless the
         // name is mixtral-style (8x7b).
         assert_eq!((total, active), (0, 0));
+    }
+
+    #[test]
+    fn find_draft_matches_dflash_sibling() {
+        let dir = std::env::temp_dir().join(format!("lm-draft-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("Muse-Glimmer-30B-UD-Q4_K_XL.gguf");
+        let dflash = dir.join("dflash-Muse-Glimmer-30B-kquant.gguf");
+        std::fs::write(&model, b"").unwrap();
+        std::fs::write(&dflash, b"").unwrap();
+        // The sibling carries no "draft"/"mtp-" token; only "dflash" marks it.
+        assert_eq!(find_draft(&model).as_deref(), Some(dflash.as_path()));
+        // ...and a dflash file for a DIFFERENT model must not match.
+        let other = dir.join("dflash-OtherModel-kquant.gguf");
+        std::fs::write(&other, b"").unwrap();
+        assert_eq!(find_draft(&model).as_deref(), Some(dflash.as_path()));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
