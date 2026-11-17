@@ -76,6 +76,13 @@ pub struct LoadInfo {
     /// where source is `request`, `default` or `template`. Parsed from the
     /// chat-reasoning-effort-log llama.cpp patch; None on stock builds.
     pub reasoning_effort: Option<(String, String)>,
+    /// Last effort that ACTUALLY applied (template render succeeded and the
+    /// level is one the template renders distinctly). The green marker may
+    /// only follow this - an attempt without a matching applied line failed
+    /// or was rejected by the template.
+    pub reasoning_applied: Option<String>,
+    /// Last effort the template refused: not in its capability-probed levels.
+    pub reasoning_rejected: Option<String>,
 }
 
 impl LoadInfo {
@@ -253,6 +260,20 @@ pub fn parse(text: &str) -> LoadInfo {
                 let source = parts.next().map(|s| s.trim_end_matches(')')).unwrap_or("").to_string();
                 info.reasoning_effort = Some((value, source));
             }
+        }
+        // post-render confirmations: the attempt above only proves the server
+        // accepted the value; these prove the template actually applied it.
+        if let Some(rest) = line.split("chat: reasoning_effort applied '").nth(1) {
+            info.reasoning_applied = Some(rest.trim_end_matches('\'').to_string());
+        }
+        if let Some(rest) = line.split("chat: reasoning_effort rejected '").nth(1) {
+            info.reasoning_rejected = Some(
+                rest.trim_end_matches('\'')
+                    .split('\'')
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
         }
         if line.contains("getting device memory data for the extra model")
             || line.contains("common_speculative_init_result: loading draft model")
@@ -473,18 +494,21 @@ mod tests {
     fn reasoning_effort_log_lines_are_parsed() {
         let text = "\
 1.0.0 I chat: reasoning_effort = 'medium' (default)
-2.0.0 I chat: reasoning_effort = 'high' (request)
-3.0.0 I chat: reasoning_effort = (template default)
-4.0.0 I chat: reasoning_effort = 'xhigh' (request)
+2.0.0 I chat: reasoning_effort applied 'medium'
+3.0.0 I chat: reasoning_effort = 'high' (request)
+4.0.0 I chat: reasoning_effort applied 'high'
+5.0.0 I chat: reasoning_effort = 'max' (request)
+6.0.0 I chat: reasoning_effort rejected 'max' (not in template levels)
+7.0.0 I chat: reasoning_effort = (template default)
 ";
         let i = parse(text);
         assert_eq!(
             i.reasoning_effort.as_ref().map(|(v, s)| (v.as_str(), s.as_str())),
-            Some(("xhigh", "request")),
-            "last request wins"
+            Some(("", "template default")),
+            "last attempt wins"
         );
-        let i2 = parse("9.9 I chat: reasoning_effort = (template default)\n");
-        assert_eq!(i2.reasoning_effort, Some((String::new(), "template default".into())));
+        assert_eq!(i.reasoning_applied.as_deref(), Some("high"), "last applied wins");
+        assert_eq!(i.reasoning_rejected.as_deref(), Some("max"));
     }
 
     #[test]

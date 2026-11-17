@@ -2194,18 +2194,18 @@ fn memory_lines(
 }
 
 /// REASONING block: every thinking level the RUNNING model's template can
-/// render, with the active one (the server-side default the launcher bound)
-/// in bold green. Levels come from the server's /props capability probe when
-/// it is up (render-based, aliases collapsed) and fall back to scanning the
-/// GGUF chat template. 'none' appears when the template can switch thinking
-/// off; 'high' collapses into 'xhigh' (the templates repprofile high to
-/// xhigh themselves). Models whose template has no knob render a single
-/// always-on row - there the harness cannot set thinking at all. The last
-/// request's effective effort (from the chat-reasoning-effort-log llama.cpp
-/// patch) is shown as provenance under the list. The active highlight
-/// follows the LAST request's effective effort: harnesses override per
-/// request, so after a '#max' request from opencode 'max' is green until a
-/// request without effort falls back to the server default.
+/// render, with the active one in bold green. The green marker follows only
+/// CONFIRMED applications (the patched server's post-render 'applied' line)
+/// - an attempt that the template rejected or that failed to render shows
+/// in orange as "attempt ... - rejected/not applied" and does not move the
+/// marker. Levels come from the server's /props capability probe when it is
+/// up (render-based, aliases collapsed) and fall back to scanning the GGUF
+/// chat template. 'none' appears when the template can switch thinking off;
+/// 'high' collapses into 'xhigh' (the templates repprofile high to xhigh
+/// themselves). Models whose template has no knob render a single always-on
+/// row - there the harness cannot set thinking at all. Without the
+/// chat-reasoning-effort-log llama.cpp patch no live data exists and the
+/// marker shows the launcher-bound server default.
 fn reasoning_lines(
     m: &Model,
     cfg: &Cfg,
@@ -2277,11 +2277,11 @@ fn reasoning_lines(
         ];
     }
 
-    // Active = what the model actually ran with last: the last request's
-    // effective effort when one is logged (harnesses override per request),
-    // falling back to the launcher-bound server default (top level of the
-    // list = template default thinks).
-    let applied_active: Option<String> = match &applied {
+    // Green follows only CONFIRMED applications: the last 'applied' line from
+    // the patched server. An attempt (request or default) whose value has no
+    // matching applied counterpart either failed to render or was rejected
+    // by the template - it shows in orange and must NOT move the marker.
+    let applied_default: Option<String> = match &applied {
         Some(v) if v.get("enable_thinking") == Some(&json!(false)) => Some("none".into()),
         Some(v) => v
             .get("reasoning_effort")
@@ -2298,9 +2298,19 @@ fn reasoning_lines(
             .or_else(|| levels.last().cloned()),
         None => levels.last().cloned(),
     };
-    let active = match live.and_then(|l| l.reasoning_effort.as_ref()) {
-        Some((v, _)) if !v.is_empty() => Some(v.clone()),
-        _ => applied_active,
+    let attempt = live.and_then(|l| l.reasoning_effort.as_ref());
+    let confirmed = live.and_then(|l| l.reasoning_applied.as_ref());
+    let rejected = live.and_then(|l| l.reasoning_rejected.as_ref());
+    let active = confirmed.cloned().or(applied_default);
+    // an attempt is "pending" when its value never got an applied line:
+    // rejected by the template levels, or the render raised (e.g. qwen's
+    // raise_exception on an unknown level)
+    let attempt_value = attempt
+        .filter(|(v, _)| !v.is_empty())
+        .map(|(v, _)| v.clone());
+    let not_applied = match &attempt_value {
+        Some(v) => confirmed.map(|s| s.as_str()) != Some(v.as_str()),
+        None => false,
     };
 
     let line = levels
@@ -2315,9 +2325,18 @@ fn reasoning_lines(
         .collect::<Vec<_>>()
         .join(", ");
     let mut b = vec![section("REASONING"), kv("reasoning", &line)];
-    // provenance for the highlighted value: where the last request's effort
-    // came from (request override vs server default vs template)
-    if let Some((v, src)) = live.and_then(|l| l.reasoning_effort.as_ref()) {
+    if not_applied {
+        let why = match &attempt_value {
+            Some(v) if rejected.map(|s| s.as_str()) == Some(v.as_str()) => "rejected by template",
+            _ => "not applied",
+        };
+        b.push(kv(
+            "attempt",
+            &format!("{YELLOW}'{}' ({}) - {why}{RESET}", attempt_value.clone().unwrap_or_default(), attempt.map(|(_, s)| s.as_str()).unwrap_or("?")),
+        ));
+    } else if let Some((v, src)) = attempt {
+        // provenance for the highlighted value: where the last request's
+        // effort came from (request override vs server default vs template)
         if v.is_empty() {
             b.push(kv("last", &format!("{DIM}({src}){RESET}")));
         } else {
