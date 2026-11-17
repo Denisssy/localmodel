@@ -30,7 +30,7 @@ pub fn is_draft(name: &str) -> bool {
     // "mtp-" is the drafter prefix (mtp-Base-...); a full model build that
     // merely ends in "-mtp.gguf" (ISTA-DASLab keeps the head inside the main
     // file) must stay visible.
-    n.contains("lilicorr") || n.contains("draft") || n.contains("mmproj") || n.contains("mtp-")
+    n.contains("lilicorr") || n.contains("dflash") || n.contains("draft") || n.contains("mmproj") || n.contains("mtp-")
 }
 
 pub fn scan(dir: &Path) -> Vec<Model> {
