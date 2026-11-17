@@ -964,6 +964,13 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     push(&mut a, "-m", &m.path.display().to_string());
     push(&mut a, f("alias"), alias);
     push(&mut a, f("ctx"), &c.ctx.to_string());
+    // Default answer cap: half the context. Thinking models burn far more
+    // than 4k tokens of reasoning on hard prompts, and requests that set
+    // max_tokens/max_completion_tokens still override this (schema aliases
+    // of n_predict). An explicit -n/--n-predict in `extra` wins as well.
+    if !shadowed_flag("-n") && !shadowed_flag("--n-predict") && !shadowed_flag("--predict") {
+        push(&mut a, "-n", &(c.ctx / 2).to_string());
+    }
     push(&mut a, f("flash_attn"), if c.flash_attn { "on" } else { "off" });
     push(&mut a, f("ctk"), &c.ctk);
     push(&mut a, f("ctv"), &c.ctv);
@@ -4276,7 +4283,7 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-9B-Q6_K.gguf --alias Ornith-1.5-9B-Q6_K \
-             --ctx-size 262144 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 262144 -n 131072 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
              --metrics --cache-reuse 256 --parallel 1 --log-verbosity 4 -ngl 99 --top-k 20 --min-p 0 \
              --spec-type draft-mtp --spec-draft-n-max 2 --batch-size 1024 --ubatch-size 256"
@@ -4290,7 +4297,7 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-35B-A3B-Q6_K.gguf --alias Ornith-1.5-35B-A3B-Q6_K \
-             --ctx-size 131072 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 131072 -n 65536 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
              --metrics --cache-reuse 256 --batch-size 2048 --ubatch-size 512 --parallel 1 \
              --log-verbosity 4 -ngl 99 --n-cpu-moe 58 --spec-type draft-mtp --spec-draft-n-max 3"
@@ -4307,7 +4314,7 @@ mod tests {
             argv(&m, Some("/nonexistent/nemo-LiLiCorr.gguf"), &c),
             "-m /nonexistent/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
              --alias NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB --ctx-size 131072 \
-             --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
+             -n 65536 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
              --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 --batch-size 2048 \
              --ubatch-size 512 --parallel 1 --log-verbosity 4 -ngl 999 \
              --n-cpu-moe 58 --spec-type draft-dflash \
@@ -4329,7 +4336,7 @@ mod tests {
         assert_eq!(
             argv(&m, Some("/nonexistent/mtp-gemma-4-12b-it-Q8_0.gguf"), &c),
             "-m /nonexistent/gemma-4-12b-it.gguf --alias gemma-4-12b-it \
-             --ctx-size 262144 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 262144 -n 131072 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
              --mmproj /nonexistent/mmproj-F16.gguf --metrics --cache-reuse 256 --parallel 1 \
              --log-verbosity 4 -ngl 99 \
@@ -4412,7 +4419,7 @@ mod tests {
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-9B-AD-Q8_0-Q6_K.gguf \
              --alias Ornith-1.5-9B-AD-Q8_0-Q6_K --ctx-size 262144 \
-             --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
+             -n 131072 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
              --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 --parallel 1 \
              --log-verbosity 4 -ngl 99 \
              --top-k 20 --min-p 0 --batch-size 1024 --ubatch-size 256"
