@@ -613,12 +613,12 @@ fn cmd_pick() -> i32 {
                 let lora = if lora { " +lora" } else { "" };
                 items.push(format!(
                     "{:<48} {:>7}{}{lora} profile",
-                    format!("{target} ({key})"),
+                    target.to_string(),
                     models::human(m.size),
                     badge,
                 ));
             }
-            None => items.push(format!("{target} ({key}){:<27} profile", "")),
+            None => items.push(format!("{target}{:<34} profile", "")),
         }
     }
     for (fam, size) in &packs {
