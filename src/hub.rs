@@ -1140,6 +1140,10 @@ impl Hub {
                     } else {
                         " ".to_string()
                     };
+                    let lora = settings::find_key(&self.work, &models::stem(&m.name))
+                        .and_then(|k| self.work.model.get(k))
+                        .and_then(|p| p.extra.as_deref())
+                        .is_some_and(|e| e.contains("--lora"));
                     let badge = if m.nextn {
                         " +mtp"
                     } else if models::find_draft(&m.path).is_some() {
@@ -1149,6 +1153,7 @@ impl Hub {
                     } else {
                         ""
                     };
+                    let badge = format!("{badge}{}", if lora { " +lora" } else { "" });
                     let text = crate::truncate(&m.name, width.saturating_sub(4));
                     format!(" {dot} {text}{DIM}{badge}{RESET}")
                 }

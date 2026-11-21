@@ -584,11 +584,42 @@ fn cmd_pick() -> i32 {
             } else {
                 ""
             };
-            format!("{:<48} {:>7}{}", m.name, models::human(m.size), draft)
+            let lora = settings::find_key(&saved, &models::stem(&m.name))
+                .and_then(|k| saved.model.get(k))
+                .and_then(|p| p.extra.as_deref())
+                .is_some_and(|e| e.contains("--lora"));
+            let lora = if lora { " +lora" } else { "" };
+            format!("{:<48} {:>7}{}{lora}", m.name, models::human(m.size), draft)
         })
         .collect();
     for (key, target) in &profiles {
-        items.push(format!("{target} ({key}){:<27} profile", ""));
+        // Dress the row like its base model: same size column and
+        // badges (+mtp/+draft/MoE) - a profile is a variant of that model.
+        match ms.iter().find(|m| models::stem(&m.name) == *target) {
+            Some(m) => {
+                let badge = if m.nextn {
+                    " +mtp"
+                } else if models::find_draft(&m.path).is_some() {
+                    " +draft"
+                } else if m.moe {
+                    " MoE"
+                } else {
+                    ""
+                };
+                let lora = settings::find_key(&saved, key)
+                    .and_then(|k| saved.model.get(k))
+                    .and_then(|p| p.extra.as_deref())
+                    .is_some_and(|e| e.contains("--lora"));
+                let lora = if lora { " +lora" } else { "" };
+                items.push(format!(
+                    "{:<48} {:>7}{}{lora} profile",
+                    format!("{target} ({key})"),
+                    models::human(m.size),
+                    badge,
+                ));
+            }
+            None => items.push(format!("{target} ({key}){:<27} profile", "")),
+        }
     }
     for (fam, size) in &packs {
         let tuned = if settings::find_key(&saved, &format!("{fam}/{size}")).is_some() {
