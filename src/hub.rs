@@ -1152,9 +1152,27 @@ impl Hub {
                     let text = crate::truncate(&m.name, width.saturating_sub(4));
                     format!(" {dot} {text}{DIM}{badge}{RESET}")
                 }
-                Entry::Profile(_, key) => {
-                    let text = crate::truncate(key, width.saturating_sub(7));
-                    format!("   {DIM}↳ {text}{RESET} {DIM}profile{RESET}")
+                Entry::Profile(mi, key) => {
+                    // Same dressing as the model row: the base model's
+                    // badges (+mtp/+draft/MoE) and quant belong to the
+                    // profile too - a profile is a variant of that model.
+                    let m = &self.ms[*mi];
+                    let badge = if m.nextn {
+                        " +mtp"
+                    } else if models::find_draft(&m.path).is_some() {
+                        " +draft"
+                    } else if m.moe {
+                        " MoE"
+                    } else {
+                        ""
+                    };
+                    let quant = if m.quant.is_empty() || m.quant == "unknown" {
+                        String::new()
+                    } else {
+                        format!(" {}", m.quant)
+                    };
+                    let text = crate::truncate(key, width.saturating_sub(9));
+                    format!("   {DIM}↳ {text}{RESET} {DIM}profile{badge}{quant}{RESET}")
                 }
                 Entry::Pack(f, s) => format!("   {DIM}{f}/{s}{RESET}"),
                 Entry::Add => format!(" {GREEN}+ add from HuggingFace{RESET}"),

@@ -484,6 +484,13 @@ profile_knobs! {
         , Applies::All
         , "--cache-reuse"
         , "Reuse a matching KV prefix in chunks of this size; 0 disables reuse. 256 skips re-prefill of repeated prompts.";
+    max_tokens : u32
+        , "max answer tokens"
+        , Group::Context
+        , Kind::Num { min: 256, max: 4_194_304, unit: "tok" }
+        , Applies::All
+        , "-n"
+        , "Answer cap per request. Default: 25% of ctx (thinking models split it between reasoning and the answer); raise toward 50% for thinking-heavy models like qwen.";
     draft_n_min : u16
         , "draft min tokens"
         , Group::Speed

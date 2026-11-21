@@ -225,6 +225,8 @@ impl crate::Cfg {
             defaults.cache_reuse,
             Some(256),
         );
+        let (max_tokens, max_tokens_src) =
+            pick(None, model.and_then(|p| p.max_tokens), defaults.max_tokens, None);
         let (draft_n_min, draft_n_min_src) = pick(
             o.draft_n_min,
             model.and_then(|p| p.draft_n_min),
@@ -452,6 +454,9 @@ impl crate::Cfg {
         }
         let cache_reuse = cache_reuse.expect("cache_reuse has a builtin default");
         origins.push(Origin::new("cache_reuse", cache_reuse.to_string(), cache_reuse_src));
+        if let Some(v) = max_tokens {
+            origins.push(Origin::new("max_tokens", v.to_string(), max_tokens_src));
+        }
         if let Some(v) = draft_n_min {
             origins.push(Origin::new("draft_n_min", v.to_string(), draft_n_min_src));
         }
@@ -558,6 +563,7 @@ impl crate::Cfg {
             threads_batch,
             prio,
             cache_reuse: Some(cache_reuse),
+            max_tokens,
             draft_n_min,
             draft_p_min,
             ctk,

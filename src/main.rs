@@ -61,6 +61,8 @@ struct RunOpts {
     threads_batch: Option<u32>,
     prio: Option<i32>,
     cache_reuse: Option<u32>,
+    /// answer cap (-n); None means the launcher default of ctx/4
+    max_tokens: Option<u32>,
     draft_n_min: Option<u16>,
     draft_p_min: Option<f64>,
     top_k: Option<u32>,
@@ -145,6 +147,7 @@ impl Default for RunOpts {
             threads_batch: None,
             prio: None,
             cache_reuse: None,
+            max_tokens: None,
             draft_n_min: None,
             draft_p_min: None,
             top_k: None,
@@ -212,6 +215,8 @@ struct Cfg {
     threads_batch: Option<u32>,
     prio: Option<i32>,
     cache_reuse: Option<u32>,
+    /// answer cap (-n); None means the launcher default of ctx/4
+    max_tokens: Option<u32>,
     draft_n_min: Option<u16>,
     draft_p_min: Option<f64>,
     ctk: String,
@@ -944,6 +949,18 @@ fn default_effort(caps: &jinja::TemplateCaps) -> Option<String> {
     }
 }
 
+/// The speculative implementation a draft file needs, from its name.
+fn draft_spec_type(name: &str) -> &'static str {
+    let n = name.to_lowercase();
+    if n.contains("mtp") {
+        "draft-mtp"
+    } else if n.contains("dspark") {
+        "draft-dspark"
+    } else {
+        "draft-dflash"
+    }
+}
+
 fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) -> Vec<String> {
     let n = m.name.to_lowercase();
     let mut a: Vec<String> = Vec::new();
@@ -964,12 +981,14 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
     push(&mut a, "-m", &m.path.display().to_string());
     push(&mut a, f("alias"), alias);
     push(&mut a, f("ctx"), &c.ctx.to_string());
-    // Default answer cap: half the context. Thinking models burn far more
-    // than 4k tokens of reasoning on hard prompts, and requests that set
-    // max_tokens/max_completion_tokens still override this (schema aliases
-    // of n_predict). An explicit -n/--n-predict in `extra` wins as well.
+    // Default answer cap: a quarter of the context (agreed 25-50% band; 25%
+    // leaves thinking models room for reasoning AND the answer). Requests
+    // that set max_tokens/max_completion_tokens still override this (schema
+    // aliases of n_predict). The max_tokens knob and an explicit -n in
+    // `extra` win as well.
     if !shadowed_flag("-n") && !shadowed_flag("--n-predict") && !shadowed_flag("--predict") {
-        push(&mut a, "-n", &(c.ctx / 2).to_string());
+        let cap = c.max_tokens.unwrap_or(c.ctx / 4);
+        push(&mut a, "-n", &cap.to_string());
     }
     push(&mut a, f("flash_attn"), if c.flash_attn { "on" } else { "off" });
     push(&mut a, f("ctk"), &c.ctk);
@@ -1110,8 +1129,7 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             // Explicit draft file: the profile's draft_model, or the
             // auto-detected sibling. dflash (LiLiCorr) and MTP heads are
             // told apart by the file name.
-            let is_mtp = d.to_string_lossy().to_lowercase().contains("mtp");
-            push(&mut a, "--spec-type", if is_mtp { "draft-mtp" } else { "draft-dflash" });
+            push(&mut a, "--spec-type", draft_spec_type(&d.to_string_lossy()));
             push(&mut a, "--spec-draft-model", &d.display().to_string());
             push(&mut a, f("draft_gpu"), "999");
             push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
@@ -1130,8 +1148,7 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
         if let Some(d) = draft {
             // Explicit external draft (profile draft_model, or the
             // auto-detected sibling): wins even over a built-in MTP head.
-            let is_mtp = d.to_string_lossy().to_lowercase().contains("mtp");
-            push(&mut a, "--spec-type", if is_mtp { "draft-mtp" } else { "draft-dflash" });
+            push(&mut a, "--spec-type", draft_spec_type(&d.to_string_lossy()));
             push(&mut a, "--spec-draft-model", &d.display().to_string());
             push(&mut a, f("draft_gpu"), "999");
             push(&mut a, f("draft_tokens"), &c.draft_tokens.unwrap_or(7).to_string());
@@ -1164,8 +1181,8 @@ fn build_args(m: &Model, draft: Option<&Path>, alias: &str, port: u16, c: &Cfg) 
             // --spec-draft-device none matters for a CPU draft: without it
             // llama.cpp still reserves ~700 MiB of draft compute buffers on
             // the GPU even with --spec-draft-ngl 0.
-            let is_mtp = d.to_string_lossy().to_lowercase().contains("mtp");
-            let spec = if is_mtp { "draft-mtp" } else { "draft-dflash" };
+            let spec = draft_spec_type(&d.to_string_lossy());
+            let is_mtp = spec == "draft-mtp";
             push(&mut a, "--spec-type", spec);
             push(&mut a, "--spec-draft-model", &d.display().to_string());
             if c.draft_gpu {
@@ -2450,8 +2467,8 @@ fn launch_facts_lines(m: &Model, cfg: &Cfg, draft: Option<&Path>) -> Vec<String>
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| d.display().to_string());
-        let is_mtp = name.to_lowercase().contains("mtp");
-        let spec = if is_mtp { "draft-mtp" } else { "draft-dflash" };
+        let spec = draft_spec_type(&name);
+        let is_mtp = spec == "draft-mtp";
         let nmax = cfg.draft_tokens.unwrap_or(if is_mtp { 1 } else { 7 });
         v.push(kv("Draft", &format!("{name}  {DIM}· {spec} · n-max {nmax}{RESET}")));
     } else if m.nextn {
@@ -4464,7 +4481,7 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-9B-Q6_K.gguf --alias Ornith-1.5-9B-Q6_K \
-             --ctx-size 262144 -n 131072 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 262144 -n 65536 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
              --metrics --cache-reuse 256 --parallel 1 --log-verbosity 4 -ngl 99 --top-k 20 --min-p 0 \
              --spec-type draft-mtp --spec-draft-n-max 2 --batch-size 1024 --ubatch-size 256"
@@ -4478,7 +4495,7 @@ mod tests {
         assert_eq!(
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-35B-A3B-Q6_K.gguf --alias Ornith-1.5-35B-A3B-Q6_K \
-             --ctx-size 131072 -n 65536 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 131072 -n 32768 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
              --metrics --cache-reuse 256 --batch-size 2048 --ubatch-size 512 --parallel 1 \
              --log-verbosity 4 -ngl 99 --n-cpu-moe 58 --spec-type draft-mtp --spec-draft-n-max 3"
@@ -4495,7 +4512,7 @@ mod tests {
             argv(&m, Some("/nonexistent/nemo-LiLiCorr.gguf"), &c),
             "-m /nonexistent/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf \
              --alias NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB --ctx-size 131072 \
-             -n 65536 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
+             -n 32768 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
              --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 --batch-size 2048 \
              --ubatch-size 512 --parallel 1 --log-verbosity 4 -ngl 999 \
              --n-cpu-moe 58 --spec-type draft-dflash \
@@ -4517,7 +4534,7 @@ mod tests {
         assert_eq!(
             argv(&m, Some("/nonexistent/mtp-gemma-4-12b-it-Q8_0.gguf"), &c),
             "-m /nonexistent/gemma-4-12b-it.gguf --alias gemma-4-12b-it \
-             --ctx-size 262144 -n 131072 --flash-attn on --cache-type-k q8_0 \
+             --ctx-size 262144 -n 65536 --flash-attn on --cache-type-k q8_0 \
              --cache-type-v q8_0 --temp 1 --top-p 0.95 --host 127.0.0.1 --port 8080 --jinja \
              --mmproj /nonexistent/mmproj-F16.gguf --metrics --cache-reuse 256 --parallel 1 \
              --log-verbosity 4 -ngl 99 \
@@ -4600,7 +4617,7 @@ mod tests {
             argv(&m, None, &c),
             "-m /nonexistent/Ornith-1.5-9B-AD-Q8_0-Q6_K.gguf \
              --alias Ornith-1.5-9B-AD-Q8_0-Q6_K --ctx-size 262144 \
-             -n 131072 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
+             -n 65536 --flash-attn on --cache-type-k q8_0 --cache-type-v q8_0 --temp 1 --top-p 0.95 \
              --host 127.0.0.1 --port 8080 --jinja --metrics --cache-reuse 256 --parallel 1 \
              --log-verbosity 4 -ngl 99 \
              --top-k 20 --min-p 0 --batch-size 1024 --ubatch-size 256"
