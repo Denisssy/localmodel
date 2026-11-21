@@ -30,7 +30,7 @@ pub fn is_draft(name: &str) -> bool {
     // "mtp-" is the drafter prefix (mtp-Base-...); a full model build that
     // merely ends in "-mtp.gguf" (ISTA-DASLab keeps the head inside the main
     // file) must stay visible.
-    n.contains("lilicorr") || n.contains("dflash") || n.contains("draft") || n.contains("mmproj") || n.contains("mtp-")
+    n.contains("lilicorr") || n.contains("dflash") || n.contains("dspark") || n.contains("draft") || n.contains("mmproj") || n.contains("mtp-") || n.contains("-lora")
 }
 
 pub fn scan(dir: &Path) -> Vec<Model> {
@@ -125,7 +125,7 @@ pub fn find_draft(model: &Path) -> Option<PathBuf> {
         let Some(name) = p.file_name().map(|s| s.to_string_lossy().to_lowercase()) else {
             continue;
         };
-        if !name.contains("lilicorr") && !name.contains("dflash") && !name.contains("draft") && !name.contains("mtp-") {
+        if !name.contains("lilicorr") && !name.contains("dflash") && !name.contains("dspark") && !name.contains("draft") && !name.contains("mtp-") {
             continue;
         }
         let dstem = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
