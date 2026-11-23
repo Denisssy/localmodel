@@ -297,6 +297,25 @@ pub fn installed_text() -> io::Result<RunOutput> {
     run(&bin, &args)
 }
 
+/// Max context an installed pack was configured with (from its saved strata
+/// config). Used as the picker's default so launching a pack through
+/// localmodel doesn't silently cap it at the generic 131072.
+pub fn pack_max_context(family: &str, size: &str) -> Option<u32> {
+    let home = env::var("HOME").ok()?;
+    let path = PathBuf::from(home)
+        .join(".local/share/strata/install")
+        .join(format!("strata-{family}-{size}.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&text).ok()?;
+    let args = json.get("args")?.as_array()?;
+    for (i, a) in args.iter().enumerate() {
+        if a.as_str() == Some("--max-context") {
+            return args.get(i + 1)?.as_str()?.parse().ok();
+        }
+    }
+    None
+}
+
 /// `strata models inspect <pack> --json` for a single installed pack.
 pub fn inspect_model(id: &str) -> io::Result<RunOutput> {
     let bin = strata_bin().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "strata"))?;

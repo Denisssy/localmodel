@@ -523,6 +523,14 @@ fn cmd_stop() -> i32 {
     0
 }
 
+/// Known Strata family names. A pack id is `<family>-<model>`, but some
+/// families (e.g. `inkling-2-mini`) contain hyphens themselves, so splitting
+/// on the first '-' is wrong. Match the longest known family prefix.
+const STRATA_FAMILIES: &[&str] = &[
+    "inkling-2-mini", "hy4-flash", "qwen36", "qwen38", "nvfp4",
+    "qwen", "swift", "coder", "unsloth", "gyro",
+];
+
 /// Parse `strata models list --installed` output into (family, size) pairs.
 /// Only lines whose second column is `present` are installed.
 fn strata_packs_from(text: &str) -> Vec<(String, String)> {
@@ -530,11 +538,18 @@ fn strata_packs_from(text: &str) -> Vec<(String, String)> {
         .filter_map(|l| {
             let mut it = l.split_whitespace();
             let id = it.next()?;
-            if it.next() != Some("present") || !id.contains('-') {
+            if it.next() != Some("present") {
                 return None;
             }
-            let (fam, size) = id.split_once('-')?;
-            Some((fam.to_string(), size.to_string()))
+            let family = STRATA_FAMILIES
+                .iter()
+                .filter(|f| id.starts_with(&format!("{f}-")))
+                .max_by_key(|f| f.len())?;
+            let size = &id[family.len() + 1..];
+            if size.is_empty() {
+                return None;
+            }
+            Some((family.to_string(), size.to_string()))
         })
         .collect()
 }
@@ -1654,7 +1669,13 @@ fn cmd_strata(args: &[String]) -> i32 {
             "--repl" => repl = true,
             "--plan" => {
                 // A plan is read-only and prints what would download.
-                let mut spec = engine::StrataSpec::new(ctx.unwrap_or(131072), port.unwrap_or(8080));
+                let fam = family.as_deref().or_else(|| positional.first().map(String::as_str)).unwrap_or("");
+                let sz = size.as_deref().or_else(|| positional.get(1).map(String::as_str)).unwrap_or("");
+                let pack_ctx = engine::pack_max_context(fam, sz);
+                let mut spec = engine::StrataSpec::new(
+                    ctx.or(pack_ctx).unwrap_or(131072),
+                    port.unwrap_or(8080),
+                );
                 spec.family = family.clone().or_else(|| positional.first().cloned());
                 spec.size = size.clone().or_else(|| positional.get(1).cloned());
                 spec.kv = kv.clone().unwrap_or_else(|| "int8".into());
@@ -1708,7 +1729,10 @@ fn cmd_strata(args: &[String]) -> i32 {
         eprintln!("warning: no settings profile '{key}', using defaults for {family}/{size}");
     }
     let prof = saved.for_model(&key);
-    let ctx = ctx.or(prof.ctx).unwrap_or(131072);
+    let ctx = ctx
+        .or(prof.ctx)
+        .or_else(|| engine::pack_max_context(&family, &size))
+        .unwrap_or(131072);
     let port = port.or(prof.port).unwrap_or_else(|| server::free_port(8080));
 
     let mut spec = engine::StrataSpec::new(ctx, port);
@@ -4747,11 +4771,14 @@ mod tests {
     #[test]
     fn strata_packs_parse_installed_listing() {
         let text = "qwen36-ud-q4_k_xl  present  qwen3.6-35b-a3b-ud-q4_k_xl\n\
+                    inkling-2-mini-sq-20  present  inkling-2-mini-sq-20\n\
                     qwen38-flash-next  absent  qwen3.8-flash-next\n\
                     garbage line without columns\n";
         let packs = strata_packs_from(text);
-        assert_eq!(packs.len(), 1);
+        assert_eq!(packs.len(), 2);
         assert_eq!(packs[0], ("qwen36".to_string(), "ud-q4_k_xl".to_string()));
+        // hyphenated family must not be chopped at the first '-'
+        assert_eq!(packs[1], ("inkling-2-mini".to_string(), "sq-20".to_string()));
     }
 
     /// Every line of a box must be exactly `cols` wide or narrower, and the
